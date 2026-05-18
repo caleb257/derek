@@ -1,0 +1,18 @@
+{
+  "name": "derek-worker",
+  "version": "1.0.0",
+  "description": "Derek IMAP polling worker",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "imapflow": "^1.0.162",
+    "mailparser": "^3.6.9",
+    "@anthropic-ai/sdk": "^0.39.0",
+    "googleapis": "^140.0.0",
+    "node-telegram-bot-api": "^0.66.0",
+    "dotenv": "^16.4.5",
+    "axios": "^1.7.2"
+  }
+}

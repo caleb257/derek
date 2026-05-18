@@ -1,0 +1,16 @@
+{
+  "name": "derek-the-dealer",
+  "version": "1.0.0",
+  "description": "Coralstone Capital Group — Deal Harvesting System",
+  "private": true,
+  "workspaces": [
+    "worker",
+    "api",
+    "web"
+  ],
+  "scripts": {
+    "worker": "cd worker && node index.js",
+    "api": "cd api && node index.js",
+    "web": "cd web && npm run dev"
+  }
+}
