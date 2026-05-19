@@ -3,19 +3,11 @@ require('dotenv').config({ path: '../.env' });
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
 const Anthropic = require('@anthropic-ai/sdk');
-const { google } = require('googleapis');
+const { getSheetsClient } = require("./sheets");
 const { loadBrain, logLesson } = require('./brain');
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-function getSheetsClient() {
-  const auth = new google.auth.JWT({
-    email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
-    key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-  });
-  return google.sheets({ version: 'v4', auth });
-}
 
 async function isDealEmail(subject, from, bodyPreview) {
   const res = await anthropic.messages.create({

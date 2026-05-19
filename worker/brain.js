@@ -1,43 +1,28 @@
-const { google } = require('googleapis');
+const { getSheetsClient } = require('./sheets');
 
-function getSheetsClient() {
-  const auth = new google.auth.JWT({
-    email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
-    key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-  });
-  return google.sheets({ version: 'v4', auth });
-}
-
-// Load everything Derek has learned so far
 async function loadBrain() {
   try {
     const sheets = getSheetsClient();
     const result = await sheets.spreadsheets.values.get({
       spreadsheetId: process.env.GOOGLE_SHEET_ID,
-      range: "Derek's Brain!A:F"
+      range: "Derek's Brain!A:G"
     }).catch(() => ({ data: { values: [] } }));
 
     const rows = result.data.values || [];
     if (rows.length <= 1) return '';
 
-    // Build a plain text summary of what Derek knows
-    const lessons = rows.slice(1).map(row => {
-      return `- Wholesaler: ${row[0] || '?'} | Format: ${row[1] || '?'} | What worked: ${row[2] || '?'} | Watch out for: ${row[3] || '?'}`;
-    }).join('\n');
-
-    return lessons;
+    return rows.slice(1).map(row =>
+      `- Wholesaler: ${row[0] || '?'} | Format: ${row[2] || '?'} | What worked: ${row[3] || '?'} | Watch out for: ${row[4] || '?'}`
+    ).join('\n');
   } catch (e) {
+    console.error('Brain load error:', e.message);
     return '';
   }
 }
 
-// After a successful parse, log what Derek learned
 async function logLesson(wholesalerEmail, wholesalerCompany, formatType, whatWorked, watchOutFor, fieldsExtracted) {
   try {
     const sheets = getSheetsClient();
-
-    // Ensure brain tab exists
     const spreadsheet = await sheets.spreadsheets.get({ spreadsheetId: process.env.GOOGLE_SHEET_ID });
     const existing = spreadsheet.data.sheets.map(s => s.properties.title);
 
@@ -46,7 +31,6 @@ async function logLesson(wholesalerEmail, wholesalerCompany, formatType, whatWor
         spreadsheetId: process.env.GOOGLE_SHEET_ID,
         requestBody: { requests: [{ addSheet: { properties: { title: "Derek's Brain", index: 3 } } }] }
       });
-      // Write headers
       await sheets.spreadsheets.values.update({
         spreadsheetId: process.env.GOOGLE_SHEET_ID,
         range: "Derek's Brain!A1",
@@ -55,7 +39,6 @@ async function logLesson(wholesalerEmail, wholesalerCompany, formatType, whatWor
       });
     }
 
-    // Check if this wholesaler already has a row and update it
     const existing_data = await sheets.spreadsheets.values.get({
       spreadsheetId: process.env.GOOGLE_SHEET_ID,
       range: "Derek's Brain!A:A"
@@ -70,7 +53,6 @@ async function logLesson(wholesalerEmail, wholesalerCompany, formatType, whatWor
     const rowData = [wholesalerEmail, wholesalerCompany || '', formatType || '', whatWorked || '', watchOutFor || '', fieldsExtracted.toString(), new Date().toISOString()];
 
     if (existingRow > 0) {
-      // Update existing row
       await sheets.spreadsheets.values.update({
         spreadsheetId: process.env.GOOGLE_SHEET_ID,
         range: `Derek's Brain!A${existingRow}`,
@@ -78,7 +60,6 @@ async function logLesson(wholesalerEmail, wholesalerCompany, formatType, whatWor
         requestBody: { values: [rowData] }
       });
     } else {
-      // New wholesaler — append
       await sheets.spreadsheets.values.append({
         spreadsheetId: process.env.GOOGLE_SHEET_ID,
         range: "Derek's Brain!A:A",
@@ -86,8 +67,7 @@ async function logLesson(wholesalerEmail, wholesalerCompany, formatType, whatWor
         requestBody: { values: [rowData] }
       });
     }
-
-    console.log(`🧠 Brain updated for: ${wholesalerEmail}`);
+    console.log(`🧠 Brain updated: ${wholesalerEmail}`);
   } catch (e) {
     console.error('Brain write error:', e.message);
   }
