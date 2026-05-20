@@ -297,7 +297,9 @@ Return this complete JSON (null for truly missing fields — never guess critica
 
   try {
     const text = res.content[0].text.trim().replace(/```json|```/g, '').trim();
-    return JSON.parse(text);
+    const parsed = JSON.parse(text);
+    // Handle both array and single object responses
+    return Array.isArray(parsed) ? parsed : [parsed];
   } catch (e) {
     console.error('Parse error:', e.message);
     return null;
