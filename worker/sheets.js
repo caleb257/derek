@@ -1,22 +1,33 @@
 const { google } = require('googleapis');
 
 function getSheetsClient() {
-  // Handle private key whether it has literal newlines or \n escape sequences
-  let privateKey = process.env.GOOGLE_PRIVATE_KEY || '';
-  
-  // If it doesn't already have real newlines, convert \n to actual newlines
-  if (!privateKey.includes('\n')) {
-    privateKey = privateKey.replace(/\\n/g, '\n');
+  let credentials;
+
+  // Method 1: Full JSON credentials (preferred)
+  if (process.env.GOOGLE_CREDENTIALS_JSON) {
+    try {
+      credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
+    } catch (e) {
+      console.error('Failed to parse GOOGLE_CREDENTIALS_JSON:', e.message);
+    }
   }
 
-  // Strip surrounding quotes if present
-  privateKey = privateKey.replace(/^["']|["']$/g, '');
+  // Method 2: Individual env vars fallback
+  if (!credentials) {
+    let key = process.env.GOOGLE_PRIVATE_KEY || '';
+    key = key.replace(/\\n/g, '\n').replace(/^["']|["']$/g, '');
+    credentials = {
+      client_email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
+      private_key: key,
+    };
+  }
 
   const auth = new google.auth.JWT({
-    email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
-    key: privateKey,
+    email: credentials.client_email,
+    key: credentials.private_key,
     scopes: ['https://www.googleapis.com/auth/spreadsheets'],
   });
+
   return google.sheets({ version: 'v4', auth });
 }
 
