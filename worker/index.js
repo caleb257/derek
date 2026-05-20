@@ -10,13 +10,21 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 
 async function isDealEmail(subject, from, bodyPreview) {
+  // Quick keyword check first — if obvious deal signals exist, skip Claude call
+  const combined = `${subject} ${from} ${bodyPreview}`.toLowerCase();
+  const dealKeywords = ['off market', 'wholesale', 'deal', 'property', 'arv', 'asking', 'rehab', 'flip', 'motivated', 'investment', 'sqft', 'beds', 'baths', 'price drop', 'reduced', 'for sale', 'opportunity', 'equity', 'distressed', 'vacant', 'foreclosure', 'probate', 'inherited', 'cash buyer', 'assignment', 'contract', 'closing'];
+  const hasKeyword = dealKeywords.some(kw => combined.includes(kw));
+  if (hasKeyword) return true;
+
+  // Fall back to Claude for anything ambiguous
   const res = await anthropic.messages.create({
     model: 'claude-sonnet-4-20250514',
     max_tokens: 50,
-    messages: [{ role: 'user', content: `Is this a wholesale real estate deal email being offered for sale? YES or NO only.\nFrom: ${from}\nSubject: ${subject}\nPreview: ${bodyPreview.substring(0, 300)}` }]
+    messages: [{ role: 'user', content: `Is this email about a real estate property being offered for sale, a wholesale deal, an investment property, or anything related to buying/selling real estate? Be generous — if there is ANY chance it is a real estate deal, say YES. Answer YES or NO only.\nFrom: ${from}\nSubject: ${subject}\nPreview: ${bodyPreview.substring(0, 500)}` }]
   });
   return res.content[0].text.trim().toUpperCase().startsWith('YES');
 }
+
 
 async function extractDealData(from, subject, textBody, htmlBody, attachmentNames) {
   const body = textBody || htmlBody?.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ') || '';
@@ -301,6 +309,14 @@ function normalizeAddress(address, city, zip) {
   return `${address} ${city || ''} ${zip || ''}`.toLowerCase().replace(/\s+/g, ' ').replace(/[^\w\s]/g, '').trim();
 }
 
+// Flatten any value to a plain string safe for Sheets
+function s(v) {
+  if (v === null || v === undefined) return '';
+  if (typeof v === 'boolean') return v ? 'YES' : 'NO';
+  if (typeof v === 'object') return JSON.stringify(v);
+  return String(v);
+}
+
 function getHeaders() {
   return [
     'Date Received','Expires',
@@ -344,41 +360,42 @@ function getHeaders() {
 function buildRow(deal, subject, messageId) {
   const now = new Date();
   const expires = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+  const d = (k) => s(deal[k]);
   return [
     now.toISOString(), expires.toISOString(),
-    deal.address, deal.address2, deal.city, deal.state, deal.zip, deal.county, deal.neighborhood, deal.subdivision, deal.cross_streets, deal.google_maps_address,
-    deal.property_type, deal.beds, deal.baths, deal.half_baths, deal.sqft_living, deal.sqft_total, deal.lot_size_sqft, deal.lot_size_acres, deal.year_built, deal.stories, deal.units,
-    deal.garage, deal.garage_spaces, deal.carport, deal.pool, deal.basement, deal.basement_sqft, deal.attic,
-    deal.construction_type, deal.foundation_type, deal.roof_type, deal.roof_age, deal.hvac_type, deal.hvac_age, deal.water_heater, deal.water_heater_age, deal.electrical_panel, deal.plumbing_type, deal.windows, deal.flooring,
-    deal.kitchen_condition, deal.bath_condition, deal.exterior_condition, deal.interior_condition, deal.overall_condition,
-    deal.asking_price, deal.arv_stated, deal.repair_estimate_stated, deal.repair_scope_notes, deal.assignment_fee, deal.net_to_seller,
-    deal.price_per_sqft, deal.arv_per_sqft, deal.equity_stated, deal.equity_percent, deal.profit_potential_stated, deal.monthly_rent_current, deal.monthly_rent_market, deal.gross_rent_multiplier, deal.cap_rate_stated, deal.noi_stated, deal.annual_gross_income, deal.annual_expenses_stated, deal.cash_on_cash_stated, deal.price_reduction_from, deal.price_reduction_amount,
-    deal.contact_1_name, deal.contact_1_title, deal.contact_1_company, deal.contact_1_email, deal.contact_1_phone, deal.contact_1_phone_2, deal.contact_1_website, deal.contact_1_social,
-    deal.contact_2_name, deal.contact_2_title, deal.contact_2_company, deal.contact_2_email, deal.contact_2_phone, deal.contact_2_phone_2, deal.contact_2_website, deal.contact_2_social,
-    deal.contact_3_name, deal.contact_3_title, deal.contact_3_company, deal.contact_3_email, deal.contact_3_phone, deal.contact_3_website,
-    deal.all_emails_found, deal.all_phones_found, deal.all_names_found, deal.all_companies_found,
-    deal.seller_name, deal.seller_phone, deal.seller_email, deal.seller_situation, deal.seller_motivation, deal.seller_timeline, deal.seller_asking_originally, deal.how_seller_was_found,
-    deal.occupancy_status, deal.tenant_name, deal.tenant_phone, deal.tenant_email, deal.tenant_lease_end, deal.tenant_monthly_rent, deal.tenant_is_section_8,
-    deal.days_on_market, deal.list_date, deal.offer_deadline, deal.close_timeline, deal.close_date_target, deal.inspection_period, deal.earnest_money, deal.earnest_money_type, deal.financing_terms, deal.cash_only,
-    deal.title_company, deal.title_contact, deal.title_phone, deal.closing_agent, deal.contract_type, deal.assignment_allowed, deal.double_close_ok,
-    deal.hoa, deal.hoa_name, deal.hoa_fee, deal.hoa_fee_frequency, deal.hoa_phone, deal.hoa_includes, deal.hoa_special_assessment,
-    deal.flood_zone, deal.flood_zone_code, deal.flood_insurance_required, deal.flood_insurance_cost,
-    deal.school_district, deal.elementary_school, deal.middle_school, deal.high_school,
-    deal.taxes_annual, deal.taxes_monthly, deal.tax_year, deal.homestead_exempt,
-    deal.insurance_annual, deal.insurance_monthly,
-    deal.utility_water, deal.utility_sewer, deal.utility_electric, deal.utility_gas, deal.utility_trash, deal.utility_notes,
-    deal.zoning, deal.zoning_description, deal.parcel_id, deal.legal_description, deal.mls_number, deal.mls_status,
-    deal.property_link_main, deal.zillow_link, deal.redfin_link, deal.mls_link, deal.propstream_link, deal.google_maps_link, deal.virtual_tour_link, deal.video_link, deal.dropbox_link, deal.drive_link, deal.all_links_found,
-    deal.photos_included ? 'YES' : 'NO', deal.photo_count, deal.photo_link_1, deal.photo_link_2, deal.photo_link_3, deal.all_photo_links,
-    deal.comp_1_address, deal.comp_1_price, deal.comp_1_sqft, deal.comp_1_date, deal.comp_1_price_sqft,
-    deal.comp_2_address, deal.comp_2_price, deal.comp_2_sqft, deal.comp_2_date, deal.comp_2_price_sqft,
-    deal.comp_3_address, deal.comp_3_price, deal.comp_3_sqft, deal.comp_3_date, deal.comp_3_price_sqft,
-    deal.comp_4_address, deal.comp_4_price, deal.comp_4_sqft, deal.comp_4_date, deal.comp_4_price_sqft,
-    deal.comp_5_address, deal.comp_5_price, deal.comp_5_sqft, deal.comp_5_date, deal.comp_5_price_sqft, deal.arv_comp_notes,
-    deal.deal_source, deal.list_name, deal.campaign_name, deal.marketing_headline, deal.wholesaler_deal_id, deal.wholesaler_notes,
-    deal.repair_items_detailed, deal.what_needs_work, deal.what_is_updated, deal.permits_required,
-    deal.code_violations, deal.liens_known, deal.title_issues_known, deal.probate, deal.bankruptcy, deal.divorce, deal.foreclosure_status, deal.auction_info,
-    deal.additional_notes, deal.red_flags, deal.highlights,
+    d('address'), d('address2'), d('city'), d('state'), d('zip'), d('county'), d('neighborhood'), d('subdivision'), d('cross_streets'), d('google_maps_address'),
+    d('property_type'), d('beds'), d('baths'), d('half_baths'), d('sqft_living'), d('sqft_total'), d('lot_size_sqft'), d('lot_size_acres'), d('year_built'), d('stories'), d('units'),
+    d('garage'), d('garage_spaces'), d('carport'), d('pool'), d('basement'), d('basement_sqft'), d('attic'),
+    d('construction_type'), d('foundation_type'), d('roof_type'), d('roof_age'), d('hvac_type'), d('hvac_age'), d('water_heater'), d('water_heater_age'), d('electrical_panel'), d('plumbing_type'), d('windows'), d('flooring'),
+    d('kitchen_condition'), d('bath_condition'), d('exterior_condition'), d('interior_condition'), d('overall_condition'),
+    d('asking_price'), d('arv_stated'), d('repair_estimate_stated'), d('repair_scope_notes'), d('assignment_fee'), d('net_to_seller'),
+    d('price_per_sqft'), d('arv_per_sqft'), d('equity_stated'), d('equity_percent'), d('profit_potential_stated'), d('monthly_rent_current'), d('monthly_rent_market'), d('gross_rent_multiplier'), d('cap_rate_stated'), d('noi_stated'), d('annual_gross_income'), d('annual_expenses_stated'), d('cash_on_cash_stated'), d('price_reduction_from'), d('price_reduction_amount'),
+    d('contact_1_name'), d('contact_1_title'), d('contact_1_company'), d('contact_1_email'), d('contact_1_phone'), d('contact_1_phone_2'), d('contact_1_website'), d('contact_1_social'),
+    d('contact_2_name'), d('contact_2_title'), d('contact_2_company'), d('contact_2_email'), d('contact_2_phone'), d('contact_2_phone_2'), d('contact_2_website'), d('contact_2_social'),
+    d('contact_3_name'), d('contact_3_title'), d('contact_3_company'), d('contact_3_email'), d('contact_3_phone'), d('contact_3_website'),
+    d('all_emails_found'), d('all_phones_found'), d('all_names_found'), d('all_companies_found'),
+    d('seller_name'), d('seller_phone'), d('seller_email'), d('seller_situation'), d('seller_motivation'), d('seller_timeline'), d('seller_asking_originally'), d('how_seller_was_found'),
+    d('occupancy_status'), d('tenant_name'), d('tenant_phone'), d('tenant_email'), d('tenant_lease_end'), d('tenant_monthly_rent'), d('tenant_is_section_8'),
+    d('days_on_market'), d('list_date'), d('offer_deadline'), d('close_timeline'), d('close_date_target'), d('inspection_period'), d('earnest_money'), d('earnest_money_type'), d('financing_terms'), d('cash_only'),
+    d('title_company'), d('title_contact'), d('title_phone'), d('closing_agent'), d('contract_type'), d('assignment_allowed'), d('double_close_ok'),
+    d('hoa'), d('hoa_name'), d('hoa_fee'), d('hoa_fee_frequency'), d('hoa_phone'), d('hoa_includes'), d('hoa_special_assessment'),
+    d('flood_zone'), d('flood_zone_code'), d('flood_insurance_required'), d('flood_insurance_cost'),
+    d('school_district'), d('elementary_school'), d('middle_school'), d('high_school'),
+    d('taxes_annual'), d('taxes_monthly'), d('tax_year'), d('homestead_exempt'),
+    d('insurance_annual'), d('insurance_monthly'),
+    d('utility_water'), d('utility_sewer'), d('utility_electric'), d('utility_gas'), d('utility_trash'), d('utility_notes'),
+    d('zoning'), d('zoning_description'), d('parcel_id'), d('legal_description'), d('mls_number'), d('mls_status'),
+    d('property_link_main'), d('zillow_link'), d('redfin_link'), d('mls_link'), d('propstream_link'), d('google_maps_link'), d('virtual_tour_link'), d('video_link'), d('dropbox_link'), d('drive_link'), d('all_links_found'),
+    s(deal.photos_included), d('photo_count'), d('photo_link_1'), d('photo_link_2'), d('photo_link_3'), d('all_photo_links'),
+    d('comp_1_address'), d('comp_1_price'), d('comp_1_sqft'), d('comp_1_date'), d('comp_1_price_sqft'),
+    d('comp_2_address'), d('comp_2_price'), d('comp_2_sqft'), d('comp_2_date'), d('comp_2_price_sqft'),
+    d('comp_3_address'), d('comp_3_price'), d('comp_3_sqft'), d('comp_3_date'), d('comp_3_price_sqft'),
+    d('comp_4_address'), d('comp_4_price'), d('comp_4_sqft'), d('comp_4_date'), d('comp_4_price_sqft'),
+    d('comp_5_address'), d('comp_5_price'), d('comp_5_sqft'), d('comp_5_date'), d('comp_5_price_sqft'), d('arv_comp_notes'),
+    d('deal_source'), d('list_name'), d('campaign_name'), d('marketing_headline'), d('wholesaler_deal_id'), d('wholesaler_notes'),
+    d('repair_items_detailed'), d('what_needs_work'), d('what_is_updated'), d('permits_required'),
+    d('code_violations'), d('liens_known'), d('title_issues_known'), d('probate'), d('bankruptcy'), d('divorce'), d('foreclosure_status'), d('auction_info'),
+    d('additional_notes'), d('red_flags'), d('highlights'),
     subject, messageId
   ];
 }
@@ -404,16 +421,16 @@ async function ensureSheetSetup(sheets) {
 }
 
 async function checkDuplicate(sheets, deal) {
-  const nn = normalizeAddress(deal.address, deal.city, deal.zip);
+  const nn = normalizeAddress(d('address'), d('city'), d('zip'));
   if (!nn) return { isDuplicate: false };
   for (const tab of ['Active Deals', 'Deal Storage']) {
     const r = await sheets.spreadsheets.values.get({ spreadsheetId: process.env.GOOGLE_SHEET_ID, range: `${tab}!A:AZ` }).catch(() => ({ data: { values: [] } }));
     const rows = r.data.values || [];
     for (let i = 1; i < rows.length; i++) {
       if (nn === normalizeAddress(rows[i][2], rows[i][4], rows[i][6])) {
-        const np = deal.raw_asking_price_number;
+        const np = d('raw_asking_price_number');
         const op = parseFloat((rows[i][47] || '').toString().replace(/[^0-9.]/g, ''));
-        if (np && op && Math.abs(np - op) > 500) return { isDuplicate: true, isPriceChange: true, oldPrice: rows[i][47], newPrice: deal.asking_price };
+        if (np && op && Math.abs(np - op) > 500) return { isDuplicate: true, isPriceChange: true, oldPrice: rows[i][47], newPrice: d('asking_price') };
         return { isDuplicate: true, isPriceChange: false };
       }
     }
@@ -466,18 +483,18 @@ async function pollInbox() {
         const dup = await checkDuplicate(sheets, deal);
 
         if (dup.isDuplicate && !dup.isPriceChange) {
-          console.log(`🔁 Dupe: ${deal.address}`); dupes++;
+          console.log(`🔁 Dupe: ${d('address')}`); dupes++;
         } else if (dup.isPriceChange) {
           const row = buildRow(deal, subject, uid);
           row[47] = `${dup.newPrice} (was ${dup.oldPrice})`;
           await sheets.spreadsheets.values.append({ spreadsheetId: process.env.GOOGLE_SHEET_ID, range: 'Price Changes!A:A', valueInputOption: 'RAW', requestBody: { values: [row] } });
-          console.log(`💰 Price change: ${deal.address}`); priceChanges++;
+          console.log(`💰 Price change: ${d('address')}`); priceChanges++;
         } else {
           await sheets.spreadsheets.values.append({ spreadsheetId: process.env.GOOGLE_SHEET_ID, range: 'Active Deals!A:A', valueInputOption: 'RAW', requestBody: { values: [buildRow(deal, subject, uid)] } });
-          console.log(`✅ ${deal.address}, ${deal.city}`); newDeals++;
+          console.log(`✅ ${d('address')}, ${d('city')}`); newDeals++;
         }
 
-        await logLesson(deal.contact_1_email || from, deal.contact_1_company || '', deal.wholesaler_email_format || 'unknown', deal.what_worked_in_parsing || '', deal.watch_out_for || '', deal.fields_extracted_count || 0);
+        await logLesson(d('contact_1_email') || from, d('contact_1_company') || '', d('wholesaler_email_format') || 'unknown', d('what_worked_in_parsing') || '', d('watch_out_for') || '', d('fields_extracted_count') || 0);
 
         processedIds.add(uid);
         await new Promise(r => setTimeout(r, 1500));
