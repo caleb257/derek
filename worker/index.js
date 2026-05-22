@@ -459,6 +459,11 @@ async function pollInbox() {
   let newDeals = 0, dupes = 0, priceChanges = 0, skipped = 0;
 
   try {
+    // Handle IMAP error events before connect
+    client.on('error', (err) => {
+      console.error('📡 IMAP error event (handled):', err.message);
+    });
+    
     await client.connect();
     const lock = await client.getMailboxLock('INBOX');
     try {
