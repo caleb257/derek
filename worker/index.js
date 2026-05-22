@@ -449,7 +449,11 @@ async function pollInbox() {
     port: parseInt(process.env.IMAP_PORT || '993'),
     secure: true,
     auth: { user: process.env.IMAP_USER, pass: process.env.IMAP_PASSWORD },
-    logger: false
+    logger: false,
+    socketTimeout: 30000,
+    connectionTimeout: 30000,
+    greetingTimeout: 15000,
+    tls: { rejectUnauthorized: false }
   });
 
   let newDeals = 0, dupes = 0, priceChanges = 0, skipped = 0;
@@ -516,8 +520,14 @@ async function pollInbox() {
         console.log(`📦 Archived ${expired.length}`);
       }
     }
-  } catch (err) { console.error('❌', err.message); }
-  finally { try { await client.logout(); } catch {} }
+  } catch (err) {
+    console.error('❌ Poll error:', err.message);
+    if (err.code === 'ETIMEOUT' || err.code === 'ECONNREFUSED' || err.code === 'ENOTFOUND') {
+      console.error('📡 IMAP connection failed — check IMAP_HOST and IMAP_PASSWORD in Railway vars');
+    }
+  } finally {
+    try { await client.logout(); } catch {}
+  }
 
   console.log(`📊 ${newDeals} new | ${dupes} dupes | ${priceChanges} price changes | ${skipped} skipped`);
 }
