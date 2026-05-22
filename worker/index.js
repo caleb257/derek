@@ -496,7 +496,7 @@ async function pollInbox() {
           await sheets.spreadsheets.values.append({ spreadsheetId: process.env.GOOGLE_SHEET_ID, range: 'Price Changes!A:A', valueInputOption: 'RAW', requestBody: { values: [row] } });
           console.log(`💰 Price change: ${d('address')}`); priceChanges++;
         } else {
-          await sheets.spreadsheets.values.append({ spreadsheetId: process.env.GOOGLE_SHEET_ID, range: 'Active Deals!A:A', valueInputOption: 'RAW', requestBody: { values: [buildRow(deal, subject, uid)] } });
+          let writeErr = null; try { await sheets.spreadsheets.values.append({ spreadsheetId: process.env.GOOGLE_SHEET_ID, range: 'Active Deals!A:A', valueInputOption: 'RAW', requestBody: { values: [buildRow(deal, subject, uid)] } }); console.log(`✅ ${d('address')}, ${d('city')}`); newDeals++; } catch(se) { writeErr = se; console.error('❌ Sheet write error:', se.message, se.response?.data?.error?.message); }
           console.log(`✅ ${d('address')}, ${d('city')}`); newDeals++;
         }
 
