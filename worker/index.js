@@ -28,13 +28,9 @@ function isDealByKeywords(subject, from) {
   return keywords.some(kw => combined.includes(kw));
 }
 
-async function isDealEmail(subject, from, bodyPreview) {
-  if (isDealByKeywords(subject, from)) return true;
-  const res = await anthropic.messages.create({
-    model: 'claude-sonnet-4-20250514', max_tokens: 50,
-    messages: [{ role: 'user', content: `Is this a real estate deal email? YES or NO.\nFrom: ${from}\nSubject: ${subject}\nPreview: ${bodyPreview.substring(0, 300)}` }]
-  });
-  return res.content[0].text.trim().toUpperCase().startsWith('YES');
+function isDealEmail(subject, from) {
+  // Keywords only — zero API calls for screening
+  return isDealByKeywords(subject, from);
 }
 
 async function extractDeals(from, subject, body) {
@@ -42,7 +38,7 @@ async function extractDeals(from, subject, body) {
   const brainNote = brainContext ? `\nKNOWN WHOLESALER FORMATS:\n${brainContext}` : '';
 
   const res = await anthropic.messages.create({
-    model: 'claude-sonnet-4-20250514', max_tokens: 8000,
+    model: 'claude-sonnet-4-20250514', max_tokens: 4000,
     system: `You are Derek the Dealer, acquisitions analyst for Coralstone Capital Group, Tampa Bay FL. Extract ALL properties from wholesale deal emails. Return a JSON ARRAY — one object per property. Return ONLY valid JSON array, no markdown.${brainNote}`,
     messages: [{ role: 'user', content: `Extract every property as a JSON array. Each object must have (null if not found): address, city, state, zip, beds, baths, sqft_living, lot_size_sqft, year_built, pool, garage, construction_type, roof_type, roof_age, hvac_age, asking_price, arv_stated, repair_estimate_stated, close_date_target, contact_1_name, contact_1_company, contact_1_email, contact_1_phone, contact_2_name, contact_2_phone, all_phones_found, all_emails_found, seller_situation, hoa, flood_zone, taxes_annual, drive_link, all_links_found, photos_included, marketing_headline, what_needs_work, what_is_updated, red_flags, additional_notes, wholesaler_email_format, what_worked_in_parsing, watch_out_for, raw_asking_price_number, raw_arv_number\n\nFROM: ${from}\nSUBJECT: ${subject}\nBODY:\n${body.substring(0, 12000)}` }]
   });
@@ -107,7 +103,17 @@ function createImapClient() {
   return client;
 }
 
-const processedIds = new Set();
+const PROCESSED_FILE = '/tmp/derek_processed.json';
+let processedIds = new Set();
+try {
+  const data = require('fs').readFileSync(PROCESSED_FILE, 'utf8');
+  processedIds = new Set(JSON.parse(data));
+  console.log(`📂 Loaded ${processedIds.size} already-processed email IDs`);
+} catch {}
+
+function saveProcessedIds() {
+  try { require('fs').writeFileSync(PROCESSED_FILE, JSON.stringify([...processedIds])); } catch {}
+}
 
 async function pollInbox() {
   console.log(`\n🔍 [${new Date().toLocaleTimeString()}] Polling...`);
@@ -161,6 +167,7 @@ async function pollInbox() {
         if (!isConfirmedDeal) {
           skipped++;
           processedIds.add(candidate.uid);
+          saveProcessedIds();
           continue;
         }
 
@@ -204,6 +211,7 @@ async function pollInbox() {
 
         await logLesson(deals[0]?.contact_1_email || candidate.from, deals[0]?.contact_1_company || '', deals[0]?.wholesaler_email_format || '', deals[0]?.what_worked_in_parsing || '', deals[0]?.watch_out_for || '', deals.length);
         processedIds.add(candidate.uid);
+        saveProcessedIds();
         await new Promise(r => setTimeout(r, 1000));
       }
     } finally { lock.release(); }
