@@ -2,245 +2,140 @@ require('dotenv').config({ path: '../.env' });
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
 const Anthropic = require('@anthropic-ai/sdk');
-const { getSheetsClient } = require('./sheets');
-const { loadBrain, logLesson } = require('./brain');
+const { google } = require('googleapis');
+const fs = require('fs');
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const SHEET_ID = process.env.GOOGLE_SHEET_ID;
+const SEEN_FILE = '/tmp/seen.json';
 
-process.on('uncaughtException', (err) => console.error('💥 Uncaught:', err.message));
-process.on('unhandledRejection', (reason) => console.error('💥 Rejected:', reason?.message || reason));
+// Never crash
+process.on('uncaughtException', e => console.error('ERR:', e.message));
+process.on('unhandledRejection', e => console.error('REJ:', e?.message || e));
 
-function s(v) {
-  if (v === null || v === undefined) return '';
-  if (typeof v === 'boolean') return v ? 'YES' : 'NO';
-  if (typeof v === 'object') return JSON.stringify(v);
-  return String(v);
+// Track seen emails across restarts
+let seen = new Set();
+try { seen = new Set(JSON.parse(fs.readFileSync(SEEN_FILE))); } catch {}
+const saveSeen = () => { try { fs.writeFileSync(SEEN_FILE, JSON.stringify([...seen])); } catch {} };
+
+// Google Sheets client
+function sheets() {
+  const creds = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
+  const auth = new google.auth.JWT(creds.client_email, null, creds.private_key, ['https://www.googleapis.com/auth/spreadsheets']);
+  return google.sheets({ version: 'v4', auth });
 }
 
-function normalizeAddress(address, city, zip) {
-  if (!address) return null;
-  return `${address} ${city || ''} ${zip || ''}`.toLowerCase().replace(/\s+/g, ' ').replace(/[^\w\s]/g, '').trim();
-}
-
-function isDealByKeywords(subject, from) {
-  const combined = `${subject} ${from}`.toLowerCase();
-  const keywords = ['off market','wholesale','arv','flip','motivated','investment','for sale','opportunity','equity','distressed','vacant','foreclosure','probate','inherited','cash buyer','assignment','deal','property available','available deals','fix flip','fix and flip'];
-  return keywords.some(kw => combined.includes(kw));
-}
-
-function isDealEmail(subject, from) {
-  // Keywords only — zero API calls for screening
-  return isDealByKeywords(subject, from);
-}
-
-async function extractDeals(from, subject, body) {
-  const brainContext = await loadBrain();
-  const brainNote = brainContext ? `\nKNOWN WHOLESALER FORMATS:\n${brainContext}` : '';
-
-  const res = await anthropic.messages.create({
-    model: 'claude-sonnet-4-20250514', max_tokens: 4000,
-    system: `You are Derek the Dealer, acquisitions analyst for Coralstone Capital Group, Tampa Bay FL. Extract ALL properties from wholesale deal emails. Return a JSON ARRAY — one object per property. Return ONLY valid JSON array, no markdown.${brainNote}`,
-    messages: [{ role: 'user', content: `Extract every property as a JSON array. Each object must have (null if not found): address, city, state, zip, beds, baths, sqft_living, lot_size_sqft, year_built, pool, garage, construction_type, roof_type, roof_age, hvac_age, asking_price, arv_stated, repair_estimate_stated, close_date_target, contact_1_name, contact_1_company, contact_1_email, contact_1_phone, contact_2_name, contact_2_phone, all_phones_found, all_emails_found, seller_situation, hoa, flood_zone, taxes_annual, drive_link, all_links_found, photos_included, marketing_headline, what_needs_work, what_is_updated, red_flags, additional_notes, wholesaler_email_format, what_worked_in_parsing, watch_out_for, raw_asking_price_number, raw_arv_number\n\nFROM: ${from}\nSUBJECT: ${subject}\nBODY:\n${body.substring(0, 12000)}` }]
+// Write a row to the sheet
+async function writeRow(row) {
+  const s = sheets();
+  // Ensure headers exist
+  const check = await s.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: 'Active Deals!A1' }).catch(() => null);
+  if (!check?.data?.values) {
+    await s.spreadsheets.values.update({
+      spreadsheetId: SHEET_ID, range: 'Active Deals!A1', valueInputOption: 'RAW',
+      requestBody: { values: [['Date','Address','City','State','Zip','Beds','Baths','Sqft','Asking Price','ARV','Repairs','Close Date','Contact Name','Contact Phone','Contact Email','Contact Company','All Phones','All Emails','Pool','Garage','Lot Sqft','Year Built','Roof Age','HVAC Age','Seller Situation','HOA','Flood Zone','Drive Link','All Links','Notes','Subject','UID']] }
+    });
+  }
+  await s.spreadsheets.values.append({
+    spreadsheetId: SHEET_ID, range: 'Active Deals!A:A', valueInputOption: 'RAW',
+    requestBody: { values: [row] }
   });
+}
 
+// Deal keywords — no API call needed
+const KEYWORDS = ['off market','wholesale','arv','flip','motivated','for sale','opportunity','equity','distressed','foreclosure','probate','deal','property available','available deals','fix flip','cash buyer','assignment','sales price','asking price','beds','baths','sqft','under roof'];
+const isDeal = (subject, from) => KEYWORDS.some(k => `${subject} ${from}`.toLowerCase().includes(k));
+
+// Extract all properties from one email body — ONE Claude call
+async function extract(from, subject, body) {
+  const res = await anthropic.messages.create({
+    model: 'claude-haiku-4-5-20251001', // cheapest model
+    max_tokens: 2000,
+    messages: [{ role: 'user', content: `You are a real estate data extractor. Extract ALL properties from this wholesale deal email. Return a JSON array (one object per property). Fields for each: address, city, state, zip, beds, baths, sqft, asking_price, arv, repairs, close_date, contact_name, contact_phone, contact_email, contact_company, all_phones, all_emails, pool, garage, lot_sqft, year_built, roof_age, hvac_age, seller_situation, hoa, flood_zone, drive_link, all_links, notes. Use null for missing. Return ONLY the JSON array.\n\nFROM: ${from}\nSUBJECT: ${subject}\nBODY:\n${body.slice(0, 8000)}` }]
+  });
   try {
     const text = res.content[0].text.trim().replace(/```json|```/g, '').trim();
     const parsed = JSON.parse(text);
     return Array.isArray(parsed) ? parsed : [parsed];
-  } catch (e) {
-    console.error('Parse error:', e.message);
-    return null;
-  }
+  } catch { return null; }
 }
 
-function getHeaders() {
-  return ['Date Received','Expires','Address','City','State','Zip','Beds','Baths','Sqft','Lot Sqft','Year Built','Pool','Garage','Construction','Roof Type','Roof Age','HVAC Age','Asking Price','ARV','Repairs','Close Date','Contact 1 Name','Contact 1 Company','Contact 1 Email','Contact 1 Phone','Contact 2 Name','Contact 2 Phone','All Phones','All Emails','Seller Situation','HOA','Flood Zone','Annual Taxes','Drive Link','All Links','Photos','Headline','What Needs Work','What Updated','Red Flags','Notes','Email Subject','Email ID'];
-}
+const v = x => (x === null || x === undefined) ? '' : String(x);
 
-function buildRow(deal, subject, uid) {
-  const now = new Date();
-  const expires = new Date(now.getTime() + 7*24*60*60*1000);
-  const d = k => s(deal[k]);
-  return [now.toISOString(), expires.toISOString(), d('address'), d('city'), d('state'), d('zip'), d('beds'), d('baths'), d('sqft_living'), d('lot_size_sqft'), d('year_built'), d('pool'), d('garage'), d('construction_type'), d('roof_type'), d('roof_age'), d('hvac_age'), d('asking_price'), d('arv_stated'), d('repair_estimate_stated'), d('close_date_target'), d('contact_1_name'), d('contact_1_company'), d('contact_1_email'), d('contact_1_phone'), d('contact_2_name'), d('contact_2_phone'), d('all_phones_found'), d('all_emails_found'), d('seller_situation'), d('hoa'), d('flood_zone'), d('taxes_annual'), d('drive_link'), d('all_links_found'), d('photos_included'), d('marketing_headline'), d('what_needs_work'), d('what_is_updated'), d('red_flags'), d('additional_notes'), s(subject), s(uid)];
-}
-
-async function ensureHeaders(sheets) {
-  const check = await sheets.spreadsheets.values.get({ spreadsheetId: process.env.GOOGLE_SHEET_ID, range: 'Active Deals!A1:A1' }).catch(() => ({ data: {} }));
-  if (!check.data.values) {
-    const h = getHeaders();
-    for (const tab of ['Active Deals','Deal Storage','Price Changes']) {
-      await sheets.spreadsheets.values.update({ spreadsheetId: process.env.GOOGLE_SHEET_ID, range: `${tab}!A1`, valueInputOption: 'RAW', requestBody: { values: [h] } }).catch(() => {});
-    }
-    console.log('✅ Headers written');
-  }
-}
-
-async function checkDuplicate(sheets, deal) {
-  const nn = normalizeAddress(deal.address, deal.city, deal.zip);
-  if (!nn) return { isDuplicate: false };
-  for (const tab of ['Active Deals','Deal Storage']) {
-    const r = await sheets.spreadsheets.values.get({ spreadsheetId: process.env.GOOGLE_SHEET_ID, range: `${tab}!A:F` }).catch(() => ({ data: { values: [] } }));
-    for (const row of (r.data.values || []).slice(1)) {
-      if (nn === normalizeAddress(row[2], row[3], row[5])) return { isDuplicate: true };
-    }
-  }
-  return { isDuplicate: false };
-}
-
-function createImapClient() {
+async function poll() {
+  console.log(`[${new Date().toLocaleTimeString()}] Polling...`);
   const client = new ImapFlow({
-    host: process.env.IMAP_HOST,
-    port: parseInt(process.env.IMAP_PORT || '993'),
-    secure: true,
+    host: process.env.IMAP_HOST, port: 993, secure: true,
     auth: { user: process.env.IMAP_USER, pass: process.env.IMAP_PASSWORD },
-    logger: false,
-    socketTimeout: 120000,
-    connectionTimeout: 60000,
-    greetingTimeout: 30000,
+    logger: false, socketTimeout: 120000, connectionTimeout: 60000,
     tls: { rejectUnauthorized: false }
   });
-  client.on('error', err => console.error('📡 IMAP error (handled):', err.message));
-  return client;
-}
-
-const PROCESSED_FILE = '/tmp/derek_processed.json';
-let processedIds = new Set();
-try {
-  const data = require('fs').readFileSync(PROCESSED_FILE, 'utf8');
-  processedIds = new Set(JSON.parse(data));
-  console.log(`📂 Loaded ${processedIds.size} already-processed email IDs`);
-} catch {}
-
-function saveProcessedIds() {
-  try { require('fs').writeFileSync(PROCESSED_FILE, JSON.stringify([...processedIds])); } catch {}
-}
-
-async function pollInbox() {
-  console.log(`\n🔍 [${new Date().toLocaleTimeString()}] Polling...`);
-  let newDeals = 0, dupes = 0, skipped = 0;
-  const client = createImapClient();
+  client.on('error', e => console.error('IMAP err:', e.message));
 
   try {
     await client.connect();
     const lock = await client.getMailboxLock('INBOX');
+    let newDeals = 0;
 
     try {
-      const since = new Date(Date.now() - 72*60*60*1000); // 72hr lookback
+      const since = new Date(Date.now() - 72 * 60 * 60 * 1000);
 
-      // Step 1: Fetch headers only first (fast, small)
+      // Phase 1: get envelopes only (cheap)
       const candidates = [];
       for await (const msg of client.fetch({ since }, { envelope: true, uid: true })) {
-        const uid = msg.uid.toString();
-        if (processedIds.has(uid)) continue;
-        const subject = msg.envelope?.subject || '';
+        const uid = String(msg.uid);
+        if (seen.has(uid)) continue;
+        const subj = msg.envelope?.subject || '';
         const from = msg.envelope?.from?.[0]?.address || '';
-        if (isDealByKeywords(subject, from)) {
-          candidates.push({ uid, subject, from });
-        } else {
-          candidates.push({ uid, subject, from, needsCheck: true });
-        }
+        if (isDeal(subj, from)) candidates.push({ uid, subj, from });
+        else { seen.add(uid); } // mark non-deals as seen immediately
       }
 
-      console.log(`📋 Found ${candidates.length} emails to evaluate`);
+      saveSeen();
+      console.log(`${candidates.length} deal emails to process`);
 
-      // Step 2: For keyword matches, fetch full body; for others, fetch text preview only
-      for (const candidate of candidates) {
-        if (processedIds.has(candidate.uid)) continue;
+      // Phase 2: fetch body only for deal emails
+      for (const c of candidates) {
+        try {
+          const msg = await client.fetchOne(c.uid, { source: true }, { uid: true });
+          const parsed = await simpleParser(msg.source);
+          const body = parsed.text || (parsed.html || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ');
 
-        let body = '';
-        let isConfirmedDeal = !candidate.needsCheck;
+          console.log(`📬 ${c.subj}`);
+          const properties = await extract(c.from, c.subj, body);
 
-        if (candidate.needsCheck) {
-          // Fetch just text part for quick check
-          try {
-            const msgData = await client.fetchOne(candidate.uid, { bodyParts: ['TEXT'] }, { uid: true });
-            const preview = msgData?.bodyParts?.get('TEXT')?.toString() || '';
-            isConfirmedDeal = await isDealEmail(candidate.subject, candidate.from, preview);
-            if (isConfirmedDeal) body = preview;
-          } catch (e) {
-            console.error(`Preview fetch error ${candidate.uid}:`, e.message);
-            processedIds.add(candidate.uid);
-            continue;
-          }
-        }
-
-        if (!isConfirmedDeal) {
-          skipped++;
-          processedIds.add(candidate.uid);
-          saveProcessedIds();
-          continue;
-        }
-
-        // Fetch full source for deal emails
-        if (!body) {
-          try {
-            const msgData = await client.fetchOne(candidate.uid, { source: true }, { uid: true });
-            const parsed = await simpleParser(msgData.source);
-            body = parsed.text || (parsed.html || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ');
-          } catch (e) {
-            console.error(`Full fetch error ${candidate.uid}:`, e.message);
-            processedIds.add(candidate.uid);
-            continue;
-          }
-        }
-
-        console.log(`📬 ${candidate.subject}`);
-
-        const deals = await extractDeals(candidate.from, candidate.subject, body);
-        if (!deals || deals.length === 0) {
-          console.warn('⚠️ No deals extracted');
-          processedIds.add(candidate.uid);
-          continue;
-        }
-        console.log(`📦 ${deals.length} propert${deals.length > 1 ? 'ies' : 'y'}`);
-
-        const sheets = getSheetsClient();
-        await ensureHeaders(sheets);
-
-        for (const deal of deals) {
-          if (!deal?.address) { console.warn('⚠️ No address, skipping'); continue; }
-          const dup = await checkDuplicate(sheets, deal);
-          if (dup.isDuplicate) {
-            console.log(`🔁 Dupe: ${deal.address}`); dupes++;
+          if (!properties || properties.length === 0) {
+            console.log('  No properties found');
           } else {
-            await sheets.spreadsheets.values.append({ spreadsheetId: process.env.GOOGLE_SHEET_ID, range: 'Active Deals!A:A', valueInputOption: 'RAW', requestBody: { values: [buildRow(deal, candidate.subject, candidate.uid)] } });
-            console.log(`✅ ${deal.address}, ${deal.city}`); newDeals++;
+            console.log(`  ${properties.length} properties`);
+            for (const p of properties) {
+              if (!p.address) continue;
+              const row = [new Date().toISOString(), v(p.address), v(p.city), v(p.state), v(p.zip), v(p.beds), v(p.baths), v(p.sqft), v(p.asking_price), v(p.arv), v(p.repairs), v(p.close_date), v(p.contact_name), v(p.contact_phone), v(p.contact_email), v(p.contact_company), v(p.all_phones), v(p.all_emails), v(p.pool), v(p.garage), v(p.lot_sqft), v(p.year_built), v(p.roof_age), v(p.hvac_age), v(p.seller_situation), v(p.hoa), v(p.flood_zone), v(p.drive_link), v(p.all_links), v(p.notes), c.subj, c.uid];
+              await writeRow(row);
+              console.log(`  ✅ ${p.address}, ${p.city}`);
+              newDeals++;
+            }
           }
-          await new Promise(r => setTimeout(r, 500));
+
+          seen.add(c.uid);
+          saveSeen();
+        } catch (e) {
+          console.error(`  Error on ${c.uid}:`, e.message);
+          seen.add(c.uid); // don't retry broken emails
+          saveSeen();
         }
-
-        await logLesson(deals[0]?.contact_1_email || candidate.from, deals[0]?.contact_1_company || '', deals[0]?.wholesaler_email_format || '', deals[0]?.what_worked_in_parsing || '', deals[0]?.watch_out_for || '', deals.length);
-        processedIds.add(candidate.uid);
-        saveProcessedIds();
-        await new Promise(r => setTimeout(r, 1000));
       }
+
+      console.log(`Done. ${newDeals} new deals written.`);
     } finally { lock.release(); }
-
-    // Archive expired
-    const sheets = getSheetsClient();
-    const r = await sheets.spreadsheets.values.get({ spreadsheetId: process.env.GOOGLE_SHEET_ID, range: 'Active Deals!A:Z' }).catch(() => ({ data: { values: [] } }));
-    const rows = r.data.values || [];
-    if (rows.length > 1) {
-      const now = new Date(), active = [rows[0]], expired = [];
-      for (let i = 1; i < rows.length; i++) { new Date(rows[i][1]) < now ? expired.push(rows[i]) : active.push(rows[i]); }
-      if (expired.length > 0) {
-        await sheets.spreadsheets.values.clear({ spreadsheetId: process.env.GOOGLE_SHEET_ID, range: 'Active Deals!A:Z' });
-        await sheets.spreadsheets.values.update({ spreadsheetId: process.env.GOOGLE_SHEET_ID, range: 'Active Deals!A1', valueInputOption: 'RAW', requestBody: { values: active } });
-        await sheets.spreadsheets.values.append({ spreadsheetId: process.env.GOOGLE_SHEET_ID, range: 'Deal Storage!A:A', valueInputOption: 'RAW', requestBody: { values: expired } });
-        console.log(`📦 Archived ${expired.length}`);
-      }
-    }
-  } catch (err) {
-    console.error('❌ Poll error:', err.message);
+  } catch (e) {
+    console.error('Poll error:', e.message);
   } finally {
     try { await client.logout(); } catch {}
   }
-
-  console.log(`📊 ${newDeals} new | ${dupes} dupes | ${skipped} skipped`);
 }
 
 const POLL_MS = parseInt(process.env.POLL_INTERVAL || '900000');
-console.log('🤙 Derek — Coralstone Capital Group');
-console.log(`📬 ${process.env.IMAP_USER} | every ${POLL_MS/60000}min\n`);
-pollInbox();
-setInterval(pollInbox, POLL_MS);
+console.log(`🤙 Derek | ${process.env.IMAP_USER} | every ${POLL_MS/60000}min`);
+poll();
+setInterval(poll, POLL_MS);
