@@ -104,7 +104,7 @@ async function pollInbox() {
     client = new ImapFlow({
       host: process.env.IMAP_HOST, port: parseInt(process.env.IMAP_PORT || '993'), secure: true,
       auth: { user: process.env.IMAP_USER, pass: process.env.IMAP_PASSWORD },
-      logger: false, socketTimeout: 30000, connectionTimeout: 30000, greetingTimeout: 15000,
+      logger: false, socketTimeout: 60000, connectionTimeout: 60000, greetingTimeout: 30000,
       tls: { rejectUnauthorized: false }
     });
     client.on('error', err => console.error('📡 IMAP error (caught):', err.message));
