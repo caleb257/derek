@@ -67,13 +67,27 @@ const HEADERS = [
 async function initSheet() {
   const s = getSheets();
   const res = await s.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: 'Active Deals!A1:A1' }).catch(() => null);
-  if (!res?.data?.values) {
+  const hasHeaders = res?.data?.values?.[0]?.[0] === 'Date Received';
+  const hasData = (await s.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: 'Active Deals!A2:A2' }).catch(() => null))?.data?.values;
+
+  if (!hasHeaders) {
+    // No headers — fresh start, clear everything including seen IDs
     await s.spreadsheets.values.clear({ spreadsheetId: SHEET_ID, range: 'Active Deals' }).catch(() => {});
     await s.spreadsheets.values.update({
       spreadsheetId: SHEET_ID, range: 'Active Deals!A1',
       valueInputOption: 'RAW', requestBody: { values: [HEADERS] }
     });
-    console.log('Sheet initialized with', HEADERS.length, 'columns');
+    // Reset seen IDs so all emails get reprocessed
+    seen = new Set();
+    saveSeen();
+    console.log('Sheet initialized with', HEADERS.length, 'columns — seen IDs reset');
+  } else if (!hasData) {
+    // Has headers but no data — sheet was cleared manually, reset seen IDs
+    seen = new Set();
+    saveSeen();
+    console.log('Sheet is empty — seen IDs reset, will reprocess all emails');
+  } else {
+    console.log('Sheet already has data — resuming normally');
   }
 }
 
