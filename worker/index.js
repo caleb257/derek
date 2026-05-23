@@ -340,15 +340,29 @@ async function initSheet() {
     console.log(`Sheet active — resuming (A1="${a1val}")`);
   }
 
-  // Other tabs — only init if completely missing
-  for (const [tab, headers] of [
+  // Get all existing tab names so we can create missing ones
+  const meta = await sc(() => s.spreadsheets.get({ spreadsheetId: SHEET_ID })).catch(() => null);
+  const existingTabs = new Set((meta?.data?.sheets || []).map(sh => sh.properties.title));
+
+  const requiredTabs = [
     ['Deal Storage', ACTIVE_HEADERS],
     ['Price Changes', PRICE_CHANGE_HEADERS],
     ['Errors', ['Date','From','Subject','UID','Error']],
     ["Derek's Brain", BRAIN_HEADERS],
     ['Seen', ['Email UID']],
     ['Wholesaler Directory', ['Company', 'Contact Name', 'Email', 'Phone', 'Website', 'Deals Sent', 'Avg Properties/Email', 'Last Deal Date', 'Property Types', 'Avg Asking Price', 'Notes']]
-  ]) {
+  ];
+
+  for (const [tab, headers] of requiredTabs) {
+    // Create tab if it doesn't exist
+    if (!existingTabs.has(tab)) {
+      await sc(() => s.spreadsheets.batchUpdate({
+        spreadsheetId: SHEET_ID,
+        requestBody: { requests: [{ addSheet: { properties: { title: tab } } }] }
+      }));
+      console.log(`Created missing tab: ${tab}`);
+    }
+    // Write headers if A1 is empty
     const check = await sc(() => s.spreadsheets.values.get({
       spreadsheetId: SHEET_ID, range: `${tab}!A1:A1`
     })).catch(() => null);
@@ -357,7 +371,7 @@ async function initSheet() {
         spreadsheetId: SHEET_ID, range: `${tab}!A1`,
         valueInputOption: 'RAW', requestBody: { values: [headers] }
       }));
-      console.log(`${tab} initialized`);
+      console.log(`${tab} headers written`);
     }
   }
 }
@@ -513,11 +527,29 @@ async function logPriceChange(p, subject, oldPrice, newPrice) {
 
 // ── ERROR LOG ─────────────────────────────────────────────────────────────────
 async function logError(from, subject, uid, error) {
-  await sc(() => getSheets().spreadsheets.values.append({
-    spreadsheetId: SHEET_ID, range: 'Errors!A:A',
-    valueInputOption: 'RAW',
-    requestBody: { values: [[new Date().toISOString(), from, subject, uid, error]] }
-  })).catch(() => {});
+  try {
+    await sc(() => getSheets().spreadsheets.values.append({
+      spreadsheetId: SHEET_ID, range: 'Errors!A:A',
+      valueInputOption: 'RAW',
+      requestBody: { values: [[new Date().toISOString(), from, subject, uid, error]] }
+    }));
+  } catch (e) {
+    if (e.message?.includes('Unable to parse range')) {
+      try {
+        const s = getSheets();
+        await sc(() => s.spreadsheets.batchUpdate({
+          spreadsheetId: SHEET_ID,
+          requestBody: { requests: [{ addSheet: { properties: { title: 'Errors' } } }] }
+        }));
+        await sc(() => s.spreadsheets.values.update({
+          spreadsheetId: SHEET_ID, range: 'Errors!A1',
+          valueInputOption: 'RAW',
+          requestBody: { values: [['Date','From','Subject','UID','Error']] }
+        }));
+        console.log('Recreated Errors tab');
+      } catch (e2) { console.error('Could not recreate Errors tab:', e2.message); }
+    }
+  }
   console.log(`⚠️ Error logged: ${error}`);
 }
 
