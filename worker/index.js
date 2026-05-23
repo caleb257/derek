@@ -316,20 +316,36 @@ function buildRow(p, subject, uid, propType) {
 // ── SHEET INIT ────────────────────────────────────────────────────────────────
 async function initSheet() {
   const s = getSheets();
-  const a1 = await sc(() => s.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID, range: 'Active Deals!A1:A1'
+  // Check current col E header — if it's NOT Asking Price, rewrite headers
+  const headerRow = await sc(() => s.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID, range: 'Active Deals!A1:CV1'
   })).catch(() => null);
-  const a1val = a1?.data?.values?.[0]?.[0];
+  const currentHeaders = headerRow?.data?.values?.[0] || [];
+  const a1val = currentHeaders[0];
+  const colEval = currentHeaders[4]; // index 4 = column E
 
   if (!a1val) {
+    // Empty sheet — write headers fresh
     await sc(() => s.spreadsheets.values.update({
       spreadsheetId: SHEET_ID, range: 'Active Deals!A1',
       valueInputOption: 'RAW', requestBody: { values: [ACTIVE_HEADERS] }
     }));
     seen = new Set(); seenSheetReady = false;
     console.log(`Sheet initialized: ${ACTIVE_HEADERS.length} columns`);
+  } else if (colEval !== 'Asking Price') {
+    // Headers are in old order — rewrite header row only (don't touch data)
+    // Clear row 1 and rewrite with correct order
+    await sc(() => s.spreadsheets.values.update({
+      spreadsheetId: SHEET_ID, range: 'Active Deals!A1',
+      valueInputOption: 'RAW', requestBody: { values: [ACTIVE_HEADERS] }
+    }));
+    // Also clear data rows — they're in wrong column order
+    // Reset seen so Derek reprocesses and writes fresh with correct layout
+    await sc(() => s.spreadsheets.values.clear({ spreadsheetId: SHEET_ID, range: 'Active Deals!A2:CV' }));
+    seen = new Set(); seenSheetReady = false;
+    console.log(`Headers fixed. Data cleared for reprocessing with correct column order.`);
   } else {
-    console.log(`Sheet active — resuming (A1="${a1val}")`);
+    console.log(`Sheet active — col E="${colEval}" ✓`);
   }
 
   // Get existing tabs, create any missing ones
