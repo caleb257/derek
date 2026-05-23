@@ -12,7 +12,6 @@ const SEEN_FILE = '/tmp/seen.json';
 process.on('uncaughtException', e => console.error('ERR:', e.message));
 process.on('unhandledRejection', e => console.error('REJ:', e?.message || e));
 
-// Persist seen email IDs across restarts
 let seen = new Set();
 try { seen = new Set(JSON.parse(fs.readFileSync(SEEN_FILE))); } catch {}
 const saveSeen = () => { try { fs.writeFileSync(SEEN_FILE, JSON.stringify([...seen])); } catch {} };
@@ -24,7 +23,7 @@ function getSheets() {
   return google.sheets({ version: 'v4', auth });
 }
 
-// ─── SHEET COLUMNS ───────────────────────────────────────────────────────────
+// ─── HEADERS ──────────────────────────────────────────────────────────────────
 const ACTIVE_HEADERS = [
   'Date Received', 'Expires',
   'Address', 'City', 'State', 'Zip', 'County', 'Subdivision',
@@ -54,227 +53,150 @@ const ACTIVE_HEADERS = [
 
 const BRAIN_HEADERS = [
   'Wholesaler Email', 'Wholesaler Company', 'Last Seen', 'Times Sent',
-  'Format Notes', 'Typical Fields', 'What Works', 'Watch Out For',
+  'Format Type', 'Typical Fields', 'What Works', 'Watch Out For',
   'Avg Properties Per Email', 'Notes'
 ];
 
 const v = x => (x === null || x === undefined) ? '' : String(x);
 
-// ─── SHEET INIT ───────────────────────────────────────────────────────────────
-async function initSheet() {
-  const s = getSheets();
+// ─── IMPROVEMENT 1: BIGGER KEYWORD LIST ──────────────────────────────────────
+const DEAL_WORDS = [
+  // Property type signals
+  'off market', 'wholesale', 'flip', 'rehab', 'fixer', 'as-is', 'as is',
+  'investment property', 'investment opportunity', 'bungalow', 'sfr',
+  // Financial signals
+  'arv', 'asking price', 'asking:', 'sales price', 'assignment fee',
+  'equity', 'cash buyer', 'cash only', 'price reduction', 'price drop', 'reduced',
+  'motivated', 'must sell', 'below market', 'deal alert',
+  // Bedroom/bath patterns (e.g. "3/2", "4/3/2")
+  '3/2', '4/2', '4/3', '2/2', '2/1', '3/1', '5/3', '5/4', '4/4', '3/3',
+  // Situation signals
+  'distressed', 'foreclosure', 'pre-foreclosure', 'probate', 'divorce',
+  'inherited', 'estate sale', 'vacant', 'absentee',
+  // Action signals
+  'available deal', 'available now', 'property available', 'new deal',
+  'deal alert', 'just listed', 'hot deal', 'assignment', 'subject to',
+  'seller financing', 'seller finance', 'sub to',
+  // Size signals
+  'sqft', 'sq ft', 'square feet', 'beds', 'baths', 'bedroom', 'bathroom',
+  'under roof', 'living area',
+  // Market signals
+  'wholesaler', 'acquisitions', 'off-market', 'pocket listing'
+];
 
-  // Check Active Deals
-  const activeCheck = await s.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID, range: 'Active Deals!A1:A1'
-  }).catch(() => null);
-  const hasActiveHeaders = activeCheck?.data?.values?.[0]?.[0] === 'Date Received';
-  const hasActiveData = !!(await s.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID, range: 'Active Deals!A2:A2'
-  }).catch(() => null))?.data?.values;
+const isDealEmail = (subj, from) => {
+  const combined = `${subj} ${from}`.toLowerCase();
+  return DEAL_WORDS.some(k => combined.includes(k));
+};
 
-  if (!hasActiveHeaders) {
-    await s.spreadsheets.values.clear({ spreadsheetId: SHEET_ID, range: 'Active Deals' }).catch(() => {});
-    await s.spreadsheets.values.update({
-      spreadsheetId: SHEET_ID, range: 'Active Deals!A1',
-      valueInputOption: 'RAW', requestBody: { values: [ACTIVE_HEADERS] }
-    });
-    seen = new Set(); saveSeen();
-    console.log(`Sheet initialized: ${ACTIVE_HEADERS.length} columns`);
-  } else if (!hasActiveData) {
-    seen = new Set(); saveSeen();
-    console.log('Sheet empty — resetting seen IDs');
-  } else {
-    console.log('Sheet has existing data — resuming');
-  }
-
-  // Check Deal Storage
-  const storageCheck = await s.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID, range: 'Deal Storage!A1:A1'
-  }).catch(() => null);
-  if (!storageCheck?.data?.values?.[0]?.[0]) {
-    await s.spreadsheets.values.update({
-      spreadsheetId: SHEET_ID, range: 'Deal Storage!A1',
-      valueInputOption: 'RAW', requestBody: { values: [ACTIVE_HEADERS] }
-    });
-    console.log('Deal Storage tab initialized');
-  }
-
-  // Check Derek's Brain
-  const brainCheck = await s.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID, range: "Derek's Brain!A1:A1"
-  }).catch(() => null);
-  if (!brainCheck?.data?.values?.[0]?.[0]) {
-    await s.spreadsheets.values.update({
-      spreadsheetId: SHEET_ID, range: "Derek's Brain!A1",
-      valueInputOption: 'RAW', requestBody: { values: [BRAIN_HEADERS] }
-    });
-    console.log("Derek's Brain tab initialized");
-  }
-}
-
-// ─── DUPLICATE DETECTION ─────────────────────────────────────────────────────
+// ─── IMPROVEMENT 2: BETTER ADDRESS NORMALIZATION ─────────────────────────────
 function normalizeAddress(addr) {
   if (!addr) return '';
   return addr.toLowerCase()
-    .replace(/\./g, '').replace(/,/g, '').replace(/\s+/g, ' ')
+    .replace(/\./g, '').replace(/,/g, '').replace(/#/g, '')
+    // Full → abbreviated
     .replace(/\bstreet\b/g, 'st').replace(/\bavenue\b/g, 'ave')
     .replace(/\bdrive\b/g, 'dr').replace(/\bboulevard\b/g, 'blvd')
     .replace(/\broad\b/g, 'rd').replace(/\bcourt\b/g, 'ct')
     .replace(/\blane\b/g, 'ln').replace(/\bplace\b/g, 'pl')
-    .trim();
+    .replace(/\bcircle\b/g, 'cir').replace(/\bterrace\b/g, 'ter')
+    .replace(/\btrail\b/g, 'trl').replace(/\bway\b/g, 'wy')
+    .replace(/\bnorth\b/g, 'n').replace(/\bsouth\b/g, 's')
+    .replace(/\beast\b/g, 'e').replace(/\bwest\b/g, 'w')
+    .replace(/\bsaint\b/g, 'st').replace(/\bmt\b/g, 'mount')
+    // Ordinals
+    .replace(/\b1st\b/g, 'first').replace(/\b2nd\b/g, 'second')
+    .replace(/\b3rd\b/g, 'third').replace(/\b4th\b/g, 'fourth')
+    .replace(/\s+/g, ' ').trim();
 }
 
 async function isDuplicate(address, city, zip) {
   if (!address) return { isDupe: false };
   const key = normalizeAddress(`${address} ${city} ${zip}`);
   const s = getSheets();
-
   for (const tab of ['Active Deals', 'Deal Storage']) {
     const res = await s.spreadsheets.values.get({
-      spreadsheetId: SHEET_ID, range: `${tab}!C:F` // Address, City, State, Zip
+      spreadsheetId: SHEET_ID, range: `${tab}!C:F`
     }).catch(() => null);
     const rows = res?.data?.values || [];
     for (let i = 1; i < rows.length; i++) {
       const existing = normalizeAddress(`${rows[i][0]} ${rows[i][1]} ${rows[i][3]}`);
-      if (existing && existing === key) {
-        return { isDupe: true, tab, row: i + 1 };
-      }
+      if (existing && existing === key) return { isDupe: true, tab };
     }
   }
   return { isDupe: false };
 }
 
-// ─── AUTO-ARCHIVE ─────────────────────────────────────────────────────────────
-async function archiveExpired() {
-  const s = getSheets();
-  const res = await s.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID, range: 'Active Deals!A:CZ'
-  }).catch(() => null);
-  const rows = res?.data?.values || [];
-  if (rows.length <= 1) return;
+// ─── IMPROVEMENT 5: STRIP EMAIL FOOTERS ──────────────────────────────────────
+function stripFooters(text) {
+  if (!text) return '';
+  // Common footer markers — cut everything after these
+  const cutMarkers = [
+    /^unsubscribe/im, /^to unsubscribe/im, /^you (are|were) receiving/im,
+    /^this email was sent/im, /^you received this/im, /^if you no longer/im,
+    /^confidentiality notice/im, /^disclaimer:/im, /^legal notice/im,
+    /^this message (is|was) sent/im, /^remove me/im, /^manage (your )?preferences/im,
+    /^privacy policy/im, /^view in browser/im, /^having trouble viewing/im,
+    /^update your email preferences/im, /^©\s*20/im,
+    /^sent from my/im, /^get outlook for/im
+  ];
 
-  const now = new Date();
-  const headers = rows[0];
-  const active = [headers];
-  const expired = [];
-
-  for (let i = 1; i < rows.length; i++) {
-    const expires = rows[i][1]; // column B = Expires
-    if (expires && new Date(expires) < now) {
-      expired.push(rows[i]);
-    } else {
-      active.push(rows[i]);
+  const lines = text.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    if (cutMarkers.some(rx => rx.test(lines[i].trim()))) {
+      return lines.slice(0, i).join('\n').trim();
     }
   }
-
-  if (expired.length === 0) return;
-
-  // Clear Active Deals and rewrite without expired rows
-  await s.spreadsheets.values.clear({ spreadsheetId: SHEET_ID, range: 'Active Deals!A:CZ' });
-  await s.spreadsheets.values.update({
-    spreadsheetId: SHEET_ID, range: 'Active Deals!A1',
-    valueInputOption: 'RAW', requestBody: { values: active }
-  });
-
-  // Append expired to Deal Storage
-  await s.spreadsheets.values.append({
-    spreadsheetId: SHEET_ID, range: 'Deal Storage!A:A',
-    valueInputOption: 'RAW', requestBody: { values: expired }
-  });
-
-  console.log(`📦 Archived ${expired.length} expired deal(s) to Deal Storage`);
+  return text.trim();
 }
 
-// ─── DEREK'S BRAIN ────────────────────────────────────────────────────────────
-async function updateBrain(fromEmail, company, subject, propertyCount, body) {
+// ─── IMPROVEMENT 6: BRAIN-INFORMED EXTRACTION ────────────────────────────────
+async function getBrainContext(fromEmail) {
   const s = getSheets();
   const res = await s.spreadsheets.values.get({
     spreadsheetId: SHEET_ID, range: "Derek's Brain!A:J"
   }).catch(() => null);
   const rows = res?.data?.values || [];
-
-  const now = new Date().toISOString();
-
-  // Find existing entry for this sender
-  let existingRow = -1;
   for (let i = 1; i < rows.length; i++) {
-    if (rows[i][0] === fromEmail) { existingRow = i + 1; break; }
+    if (rows[i][0] === fromEmail) {
+      return {
+        formatType: rows[i][4] || '',
+        typicalFields: rows[i][5] || '',
+        whatWorks: rows[i][6] || '',
+        watchOutFor: rows[i][7] || '',
+        timesSent: parseInt(rows[i][3] || '0')
+      };
+    }
   }
-
-  // Quick analysis of what format they use
-  const hasEmoji = /[\u{1F300}-\u{1FFFF}]/u.test(body);
-  const hasBullets = /^[-•*]/m.test(body);
-  const hasNumbered = /^\d+\./m.test(body);
-  const hasTable = body.includes('\t') || body.includes(' | ');
-  const formatType = hasEmoji ? 'Emoji bullets' : hasNumbered ? 'Numbered list' : hasBullets ? 'Bullet list' : hasTable ? 'Table' : 'Plain text';
-
-  if (existingRow > 0) {
-    // Update existing entry
-    const existing = rows[existingRow - 1];
-    const timesSent = parseInt(existing[3] || '0') + 1;
-    const avgProps = ((parseFloat(existing[8] || '0') * (timesSent - 1)) + propertyCount) / timesSent;
-
-    await s.spreadsheets.values.update({
-      spreadsheetId: SHEET_ID, range: `Derek's Brain!A${existingRow}`,
-      valueInputOption: 'RAW', requestBody: {
-        values: [[
-          fromEmail,
-          company || existing[1] || '',
-          now,
-          timesSent,
-          formatType,
-          existing[5] || '', // Typical fields — preserved
-          existing[6] || '', // What works — preserved
-          existing[7] || '', // Watch out for — preserved
-          avgProps.toFixed(1),
-          existing[9] || ''  // Notes — preserved
-        ]]
-      }
-    });
-    console.log(`🧠 Brain updated: ${fromEmail} (${timesSent} emails seen)`);
-  } else {
-    // New wholesaler
-    await s.spreadsheets.values.append({
-      spreadsheetId: SHEET_ID, range: "Derek's Brain!A:A",
-      valueInputOption: 'RAW', requestBody: {
-        values: [[
-          fromEmail,
-          company || '',
-          now,
-          1,
-          formatType,
-          'address, beds, baths, sqft, asking, arv, drive link, phone', // defaults
-          'Address + emoji bullets common format',
-          '',
-          propertyCount.toString(),
-          `First seen via: ${subject}`
-        ]]
-      }
-    });
-    console.log(`🧠 Brain: new wholesaler logged — ${fromEmail}`);
-  }
+  return null;
 }
-
-// ─── DEAL KEYWORDS ───────────────────────────────────────────────────────────
-const DEAL_WORDS = ['off market','wholesale','arv','flip','motivated','for sale','equity',
-  'distressed','foreclosure','probate','deal','available deals','fix flip','cash buyer',
-  'assignment','sales price','asking price','beds','baths','sqft','under roof','bungalow',
-  'rehab','investment property','property available','price reduction','reduced'];
-const isDealEmail = (subj, from) => DEAL_WORDS.some(k => `${subj} ${from}`.toLowerCase().includes(k));
 
 // ─── EXTRACTION ───────────────────────────────────────────────────────────────
 async function extractProperties(from, subject, body) {
+  // Improvement 5: strip footer before sending
+  const cleanBody = stripFooters(body);
+
+  // Improvement 6: get brain context for this sender
+  const brain = await getBrainContext(from);
+  let brainHint = '';
+  if (brain && brain.timesSent > 0) {
+    brainHint = `\n\nKNOWN SENDER INTELLIGENCE (${brain.timesSent} emails seen):
+- Format: ${brain.formatType}
+- What works: ${brain.whatWorks}
+- Watch out for: ${brain.watchOutFor}
+- Typical fields present: ${brain.typicalFields}
+Use this to improve your extraction accuracy.`;
+  }
+
   const prompt = `You are a real estate data extraction engine for Coralstone Capital Group.
-Extract EVERY property from this wholesale deal email. Return a JSON array — one object per property. Miss nothing.
+Extract EVERY property from this wholesale deal email. Return a JSON array — one object per property. Miss nothing.${brainHint}
 
 Each object must have ALL these fields (null if not found):
 address, city, state, zip, county, subdivision,
 beds, baths, half_baths, sqft, lot_sqft, lot_acres, year_built, stories,
 construction, foundation, pool, pool_notes, garage, garage_spaces,
-carport, basement, attic,
-overall_condition, roof_type, roof_age, ac_year,
-water_heater, electrical, plumbing, windows, flooring,
+carport, basement, attic, overall_condition,
+roof_type, roof_age, ac_year, water_heater, electrical, plumbing, windows, flooring,
 kitchen_notes, bath_notes,
 asking_price (number only), arv (number only), repairs_estimate (number only),
 assignment_fee (number only), equity, rent_current, rent_market,
@@ -296,7 +218,7 @@ wholesaler_company, list_name
 FROM: ${from}
 SUBJECT: ${subject}
 BODY:
-${body.slice(0, 12000)}
+${cleanBody.slice(0, 12000)}
 
 Return ONLY a valid JSON array. No markdown. No explanation.`;
 
@@ -307,7 +229,8 @@ Return ONLY a valid JSON array. No markdown. No explanation.`;
   });
 
   try {
-    const text = res.content[0].text.trim().replace(/^```json\s*/,'').replace(/^```\s*/,'').replace(/\s*```$/,'').trim();
+    const text = res.content[0].text.trim()
+      .replace(/^```json\s*/, '').replace(/^```\s*/, '').replace(/\s*```$/, '').trim();
     const parsed = JSON.parse(text);
     return Array.isArray(parsed) ? parsed : [parsed];
   } catch (e) {
@@ -319,10 +242,9 @@ Return ONLY a valid JSON array. No markdown. No explanation.`;
 // ─── ROW BUILDER ─────────────────────────────────────────────────────────────
 function buildRow(p, subject, uid) {
   const now = new Date();
-  const expires = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000); // 7 days
+  const expires = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
   return [
-    now.toISOString(),
-    expires.toISOString(),
+    now.toISOString(), expires.toISOString(),
     v(p.address), v(p.city), v(p.state), v(p.zip), v(p.county), v(p.subdivision),
     v(p.beds), v(p.baths), v(p.half_baths), v(p.sqft), v(p.lot_sqft), v(p.lot_acres),
     v(p.year_built), v(p.stories), v(p.construction), v(p.foundation),
@@ -352,6 +274,163 @@ function buildRow(p, subject, uid) {
   ];
 }
 
+// ─── SHEET INIT ───────────────────────────────────────────────────────────────
+async function initSheet() {
+  const s = getSheets();
+  const activeCheck = await s.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID, range: 'Active Deals!A1:A1'
+  }).catch(() => null);
+  const hasHeaders = activeCheck?.data?.values?.[0]?.[0] === 'Date Received';
+  const hasData = !!(await s.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID, range: 'Active Deals!A2:A2'
+  }).catch(() => null))?.data?.values;
+
+  if (!hasHeaders) {
+    await s.spreadsheets.values.clear({ spreadsheetId: SHEET_ID, range: 'Active Deals' }).catch(() => {});
+    await s.spreadsheets.values.update({
+      spreadsheetId: SHEET_ID, range: 'Active Deals!A1',
+      valueInputOption: 'RAW', requestBody: { values: [ACTIVE_HEADERS] }
+    });
+    seen = new Set(); saveSeen();
+    console.log(`Sheet initialized: ${ACTIVE_HEADERS.length} columns`);
+  } else if (!hasData) {
+    seen = new Set(); saveSeen();
+    console.log('Sheet empty — resetting seen IDs');
+  } else {
+    console.log('Sheet has data — resuming');
+  }
+
+  // Deal Storage tab
+  const storageCheck = await s.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID, range: 'Deal Storage!A1:A1'
+  }).catch(() => null);
+  if (!storageCheck?.data?.values?.[0]?.[0]) {
+    await s.spreadsheets.values.update({
+      spreadsheetId: SHEET_ID, range: 'Deal Storage!A1',
+      valueInputOption: 'RAW', requestBody: { values: [ACTIVE_HEADERS] }
+    });
+  }
+
+  // Errors tab — improvement 3
+  const errCheck = await s.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID, range: 'Errors!A1:A1'
+  }).catch(() => null);
+  if (!errCheck?.data?.values?.[0]?.[0]) {
+    await s.spreadsheets.values.update({
+      spreadsheetId: SHEET_ID, range: 'Errors!A1',
+      valueInputOption: 'RAW', requestBody: { values: [['Date', 'From', 'Subject', 'UID', 'Error']] }
+    });
+    console.log('Errors tab initialized');
+  }
+
+  // Derek's Brain tab
+  const brainCheck = await s.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID, range: "Derek's Brain!A1:A1"
+  }).catch(() => null);
+  if (!brainCheck?.data?.values?.[0]?.[0]) {
+    await s.spreadsheets.values.update({
+      spreadsheetId: SHEET_ID, range: "Derek's Brain!A1",
+      valueInputOption: 'RAW', requestBody: { values: [BRAIN_HEADERS] }
+    });
+    console.log("Derek's Brain initialized");
+  }
+}
+
+// ─── IMPROVEMENT 3: LOG ERRORS TO SHEET ──────────────────────────────────────
+async function logError(from, subject, uid, error) {
+  const s = getSheets();
+  await s.spreadsheets.values.append({
+    spreadsheetId: SHEET_ID, range: 'Errors!A:A',
+    valueInputOption: 'RAW',
+    requestBody: { values: [[new Date().toISOString(), from, subject, uid, error]] }
+  }).catch(() => {});
+  console.log(`⚠️ Error logged to sheet: ${error}`);
+}
+
+// ─── AUTO-ARCHIVE (7 days) ────────────────────────────────────────────────────
+async function archiveExpired() {
+  const s = getSheets();
+  const res = await s.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID, range: 'Active Deals!A:CZ'
+  }).catch(() => null);
+  const rows = res?.data?.values || [];
+  if (rows.length <= 1) return;
+
+  const now = new Date();
+  const headers = rows[0];
+  const active = [headers];
+  const expired = [];
+
+  for (let i = 1; i < rows.length; i++) {
+    const expires = rows[i][1];
+    if (expires && new Date(expires) < now) expired.push(rows[i]);
+    else active.push(rows[i]);
+  }
+
+  if (expired.length === 0) return;
+
+  await s.spreadsheets.values.clear({ spreadsheetId: SHEET_ID, range: 'Active Deals!A:CZ' });
+  await s.spreadsheets.values.update({
+    spreadsheetId: SHEET_ID, range: 'Active Deals!A1',
+    valueInputOption: 'RAW', requestBody: { values: active }
+  });
+  await s.spreadsheets.values.append({
+    spreadsheetId: SHEET_ID, range: 'Deal Storage!A:A',
+    valueInputOption: 'RAW', requestBody: { values: expired }
+  });
+  console.log(`📦 Archived ${expired.length} expired deal(s)`);
+}
+
+// ─── DEREK'S BRAIN UPDATE ────────────────────────────────────────────────────
+async function updateBrain(fromEmail, company, subject, propertyCount, body) {
+  const s = getSheets();
+  const res = await s.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID, range: "Derek's Brain!A:J"
+  }).catch(() => null);
+  const rows = res?.data?.values || [];
+  const now = new Date().toISOString();
+
+  const hasEmoji = /[\u{1F300}-\u{1FFFF}]/u.test(body);
+  const hasBullets = /^[-•*]/m.test(body);
+  const hasNumbered = /^\d+\./m.test(body);
+  const hasTable = body.includes('\t') || / \| /.test(body);
+  const formatType = hasEmoji ? 'Emoji bullets' : hasNumbered ? 'Numbered list'
+    : hasBullets ? 'Bullet list' : hasTable ? 'Table' : 'Plain text';
+
+  let existingRow = -1;
+  for (let i = 1; i < rows.length; i++) {
+    if (rows[i][0] === fromEmail) { existingRow = i + 1; break; }
+  }
+
+  if (existingRow > 0) {
+    const existing = rows[existingRow - 1];
+    const timesSent = parseInt(existing[3] || '0') + 1;
+    const prevAvg = parseFloat(existing[8] || '0');
+    const avgProps = ((prevAvg * (timesSent - 1)) + propertyCount) / timesSent;
+
+    await s.spreadsheets.values.update({
+      spreadsheetId: SHEET_ID, range: `Derek's Brain!A${existingRow}`,
+      valueInputOption: 'RAW', requestBody: { values: [[
+        fromEmail, company || existing[1] || '', now, timesSent,
+        formatType, existing[5] || '', existing[6] || '',
+        existing[7] || '', avgProps.toFixed(1), existing[9] || ''
+      ]] }
+    });
+    console.log(`🧠 Brain: ${fromEmail} updated (${timesSent} emails, avg ${avgProps.toFixed(1)} props)`);
+  } else {
+    await s.spreadsheets.values.append({
+      spreadsheetId: SHEET_ID, range: "Derek's Brain!A:A",
+      valueInputOption: 'RAW', requestBody: { values: [[
+        fromEmail, company || '', now, 1, formatType,
+        'address, beds, baths, sqft, asking, arv, drive link, phone',
+        'Check for Google Drive links per property',
+        '', propertyCount.toString(), `First seen: ${subject}`
+      ]] }
+    });
+    console.log(`🧠 Brain: new wholesaler logged — ${fromEmail}`);
+  }
+}
+
 async function appendRow(row) {
   const s = getSheets();
   await s.spreadsheets.values.append({
@@ -363,8 +442,6 @@ async function appendRow(row) {
 // ─── MAIN POLL ────────────────────────────────────────────────────────────────
 async function poll() {
   console.log(`\n[${new Date().toLocaleTimeString()}] Polling ${process.env.IMAP_USER}...`);
-
-  // Archive expired deals first
   await archiveExpired();
 
   const client = new ImapFlow({
@@ -375,65 +452,60 @@ async function poll() {
   });
   client.on('error', e => console.error('IMAP err (handled):', e.message));
 
-  let written = 0, dupes = 0, skipped = 0;
+  let written = 0, dupes = 0, skipped = 0, errors = 0;
 
   try {
     await client.connect();
     const lock = await client.getMailboxLock('INBOX');
 
     try {
-      const since = new Date(Date.now() - 72 * 60 * 60 * 1000);
+      // Improvement 4: 7-day lookback instead of 72 hours
+      const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
 
-      // Phase 1: headers only — zero body download
+      // Phase 1: envelopes only — zero cost
       const candidates = [];
       for await (const msg of client.fetch({ since }, { envelope: true, uid: true })) {
         const uid = String(msg.uid);
         if (seen.has(uid)) continue;
         const subj = msg.envelope?.subject || '';
         const from = msg.envelope?.from?.[0]?.address || '';
-        if (isDealEmail(subj, from)) {
-          candidates.push({ uid, subj, from });
-        } else {
-          seen.add(uid);
-        }
+        if (isDealEmail(subj, from)) candidates.push({ uid, subj, from });
+        else seen.add(uid);
       }
       saveSeen();
       console.log(`${candidates.length} deal email(s) to process`);
 
-      // Phase 2: full body + extract for deal emails only
+      // Phase 2: full body + extract
       for (const c of candidates) {
         console.log(`\n📬 ${c.subj}`);
         try {
           const msgData = await client.fetchOne(c.uid, { source: true }, { uid: true });
           const parsed = await simpleParser(msgData.source);
-          const body = parsed.text || (parsed.html || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ');
+          const rawBody = parsed.text || (parsed.html || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ');
 
-          const properties = await extractProperties(c.from, c.subj, body);
+          const properties = await extractProperties(c.from, c.subj, rawBody);
 
+          // Improvement 3: log failed extractions
           if (!properties || properties.length === 0) {
             console.log('  → No properties extracted');
+            await logError(c.from, c.subj, c.uid, 'Extraction returned 0 properties');
+            errors++;
           } else {
-            console.log(`  → ${properties.length} propert${properties.length > 1 ? 'ies' : 'y'} found`);
-
-            // Update brain for this wholesaler
+            console.log(`  → ${properties.length} propert${properties.length > 1 ? 'ies' : 'y'}`);
             const company = properties[0]?.wholesaler_company || '';
-            await updateBrain(c.from, company, c.subj, properties.length, body);
+            await updateBrain(c.from, company, c.subj, properties.length, rawBody);
 
             for (const p of properties) {
               if (!p.address) { console.log('  → Skipped (no address)'); continue; }
-
-              // Duplicate check
               const dupeCheck = await isDuplicate(p.address, p.city, p.zip);
               if (dupeCheck.isDupe) {
-                console.log(`  🔁 DUPE: ${p.address}, ${p.city} (already in ${dupeCheck.tab})`);
+                console.log(`  🔁 DUPE: ${p.address} (already in ${dupeCheck.tab})`);
                 dupes++;
-                continue;
+              } else {
+                await appendRow(buildRow(p, c.subj, c.uid));
+                console.log(`  ✅ ${p.address}, ${p.city} | Ask: $${p.asking_price} | ARV: $${p.arv}`);
+                written++;
               }
-
-              const row = buildRow(p, c.subj, c.uid);
-              await appendRow(row);
-              console.log(`  ✅ ${p.address}, ${p.city} | Ask: $${p.asking_price} | ARV: $${p.arv}`);
-              written++;
               await new Promise(r => setTimeout(r, 300));
             }
           }
@@ -443,13 +515,15 @@ async function poll() {
           await new Promise(r => setTimeout(r, 500));
         } catch (e) {
           console.error(`  Error on UID ${c.uid}:`, e.message);
+          await logError(c.from, c.subj, c.uid, e.message);
           seen.add(c.uid);
           saveSeen();
+          errors++;
         }
       }
     } finally { lock.release(); }
 
-    console.log(`\n✅ Poll done — ${written} new, ${dupes} dupes, ${skipped} skipped`);
+    console.log(`\n✅ Poll done — ${written} new | ${dupes} dupes | ${errors} errors | ${skipped} skipped`);
   } catch (e) {
     console.error('Poll error:', e.message);
   } finally {
@@ -458,9 +532,10 @@ async function poll() {
 }
 
 // ─── BOOT ─────────────────────────────────────────────────────────────────────
-const POLL_MS = parseInt(process.env.POLL_INTERVAL || '900000');
+const POLL_MS = parseInt(process.env.POLL_INTERVAL || '300000');
 console.log(`🤙 Derek | ${process.env.IMAP_USER} | every ${POLL_MS / 60000}min`);
-console.log(`Features: duplicate detection ✓ | 7-day auto-archive ✓ | wholesaler brain ✓`);
+console.log(`✓ Extended keywords | ✓ Better dupe detection | ✓ Error logging`);
+console.log(`✓ 7-day lookback | ✓ Footer stripping | ✓ Brain-informed extraction`);
 
 initSheet().then(() => {
   poll();
