@@ -799,17 +799,17 @@ async function backfillWholesalerDirectory() {
     const avgProps = rows[i][8] || '1.0';
     if (!email) continue;
     entries.push([
-      company,   // Company
-      '',        // Contact Name — not in Brain, will fill from future deals
-      email,     // Email
-      '',        // Phone — not in Brain
-      '',        // Website — not in Brain
-      timesSent, // Deals Sent
-      avgProps,  // Avg Properties/Email
-      today,     // Last Deal Date
-      '',        // Property Types
-      '',        // Avg Asking Price
-      ''         // Notes
+      company || '',  // Company (Brain col 1)
+      '',             // Contact Name — fills from future deals
+      email,          // Email (Brain col 0)
+      '',             // Phone — fills from future deals
+      '',             // Website — fills from future deals
+      isNaN(parseInt(timesSent)) ? '1' : timesSent, // Deals Sent
+      isNaN(parseFloat(avgProps)) ? '1.0' : avgProps, // Avg Properties/Email
+      today,          // Last Deal Date
+      '',             // Property Types
+      '',             // Avg Asking Price
+      ''              // Notes
     ]);
   }
 
