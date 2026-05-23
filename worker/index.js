@@ -7,43 +7,13 @@ const fs = require('fs');
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const SHEET_ID = process.env.GOOGLE_SHEET_ID;
+
 process.on('uncaughtException', e => console.error('ERR:', e.message));
 process.on('unhandledRejection', e => console.error('REJ:', e?.message || e));
 
-// Seen IDs stored in Google Sheets (persistent across Railway restarts/container moves)
-// Falls back to in-memory if sheet not ready yet
+// Seen IDs in memory + persisted to Sheets
 let seen = new Set();
 let seenSheetReady = false;
-
-async function loadSeenFromSheet() {
-  try {
-    const s = getSheets();
-    const res = await s.spreadsheets.values.get({
-      spreadsheetId: SHEET_ID, range: 'Seen!A:A'
-    }).catch(() => null);
-    const rows = res?.data?.values || [];
-    seen = new Set(rows.slice(1).map(r => r[0]).filter(Boolean));
-    seenSheetReady = true;
-    console.log(`📂 Loaded ${seen.size} seen IDs from sheet`);
-  } catch (e) {
-    console.error('Could not load seen IDs from sheet:', e.message);
-  }
-}
-
-async function saveSeen() {
-  if (!seenSheetReady) return;
-  try {
-    const s = getSheets();
-    const values = [['Email UID'], ...[...seen].map(uid => [uid])];
-    await s.spreadsheets.values.clear({ spreadsheetId: SHEET_ID, range: 'Seen!A:A' });
-    await s.spreadsheets.values.update({
-      spreadsheetId: SHEET_ID, range: 'Seen!A1',
-      valueInputOption: 'RAW', requestBody: { values }
-    });
-  } catch (e) {
-    console.error('Could not save seen IDs to sheet:', e.message);
-  }
-}
 
 function getSheets() {
   const creds = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
@@ -52,9 +22,47 @@ function getSheets() {
   return google.sheets({ version: 'v4', auth });
 }
 
-// ─── HEADERS ──────────────────────────────────────────────────────────────────
+// ── Sheets retry wrapper ──────────────────────────────────────────────────────
+async function sheetsCall(fn, retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    try { return await fn(); }
+    catch (e) {
+      if (i === retries - 1) throw e;
+      const wait = (i + 1) * 2000;
+      console.error(`  Sheets error (retry ${i+1}/${retries-1} in ${wait/1000}s):`, e.message);
+      await new Promise(r => setTimeout(r, wait));
+    }
+  }
+}
+
+// ── Seen ID persistence ───────────────────────────────────────────────────────
+async function loadSeenFromSheet() {
+  try {
+    const res = await sheetsCall(() => getSheets().spreadsheets.values.get({
+      spreadsheetId: SHEET_ID, range: 'Seen!A:A'
+    }));
+    const rows = res?.data?.values || [];
+    seen = new Set(rows.slice(1).map(r => r[0]).filter(Boolean));
+    seenSheetReady = true;
+    console.log(`📂 Loaded ${seen.size} seen IDs from sheet`);
+  } catch (e) { console.error('Could not load seen IDs:', e.message); }
+}
+
+async function saveSeen() {
+  if (!seenSheetReady) return;
+  try {
+    const values = [['Email UID'], ...[...seen].map(uid => [uid])];
+    await sheetsCall(() => getSheets().spreadsheets.values.clear({ spreadsheetId: SHEET_ID, range: 'Seen!A:A' }));
+    await sheetsCall(() => getSheets().spreadsheets.values.update({
+      spreadsheetId: SHEET_ID, range: 'Seen!A1',
+      valueInputOption: 'RAW', requestBody: { values }
+    }));
+  } catch (e) { console.error('Could not save seen IDs:', e.message); }
+}
+
+// ── Headers ───────────────────────────────────────────────────────────────────
 const ACTIVE_HEADERS = [
-  'Date Received', 'Expires',
+  'Date Received', 'Expires', 'Property Type',
   'Address', 'City', 'State', 'Zip', 'County', 'Subdivision',
   'Beds', 'Baths', 'Half Baths', 'Sqft', 'Lot Sqft', 'Lot Acres', 'Year Built', 'Stories',
   'Construction', 'Foundation', 'Pool', 'Pool Notes', 'Garage', 'Garage Spaces',
@@ -80,6 +88,12 @@ const ACTIVE_HEADERS = [
   'Wholesaler Company', 'List Name', 'Email Subject', 'Email UID'
 ];
 
+const PRICE_CHANGE_HEADERS = [
+  'Date Detected', 'Address', 'City', 'State', 'Zip',
+  'Old Asking Price', 'New Asking Price', 'Change ($)', 'Change (%)',
+  'ARV', 'Contact', 'Phone', 'Email', 'Wholesaler', 'Email Subject'
+];
+
 const BRAIN_HEADERS = [
   'Wholesaler Email', 'Wholesaler Company', 'Last Seen', 'Times Sent',
   'Format Type', 'Typical Fields', 'What Works', 'Watch Out For',
@@ -88,42 +102,45 @@ const BRAIN_HEADERS = [
 
 const v = x => (x === null || x === undefined) ? '' : String(x);
 
-// ─── IMPROVEMENT 1: BIGGER KEYWORD LIST ──────────────────────────────────────
+// ── Keywords ──────────────────────────────────────────────────────────────────
 const DEAL_WORDS = [
-  // Property type signals
-  'off market', 'wholesale', 'flip', 'rehab', 'fixer', 'as-is', 'as is',
+  'off market', 'off-market', 'wholesale', 'flip', 'rehab', 'fixer', 'as-is', 'as is',
   'investment property', 'investment opportunity', 'bungalow', 'sfr',
-  // Financial signals
   'arv', 'asking price', 'asking:', 'sales price', 'assignment fee',
   'equity', 'cash buyer', 'cash only', 'price reduction', 'price drop', 'reduced',
   'motivated', 'must sell', 'below market', 'deal alert',
-  // Bedroom/bath patterns (e.g. "3/2", "4/3/2")
-  '3/2', '4/2', '4/3', '2/2', '2/1', '3/1', '5/3', '5/4', '4/4', '3/3',
-  // Situation signals
+  '3/2', '4/2', '4/3', '2/2', '2/1', '3/1', '5/3', '5/4', '4/4', '3/3', '2/1/1', '3/2/2',
   'distressed', 'foreclosure', 'pre-foreclosure', 'probate', 'divorce',
   'inherited', 'estate sale', 'vacant', 'absentee',
-  // Action signals
   'available deal', 'available now', 'property available', 'new deal',
   'deal alert', 'just listed', 'hot deal', 'assignment', 'subject to',
   'seller financing', 'seller finance', 'sub to',
-  // Size signals
   'sqft', 'sq ft', 'square feet', 'beds', 'baths', 'bedroom', 'bathroom',
-  'under roof', 'living area',
-  // Market signals
-  'wholesaler', 'acquisitions', 'off-market', 'pocket listing'
+  'under roof', 'living area', 'wholesaler', 'acquisitions', 'pocket listing',
+  'manufactured', 'mobile home', 'duplex', 'triplex', 'fourplex', 'multi-family',
+  'commercial', 'land', 'lot for sale', 'tear down', 'teardown'
 ];
-
 const isDealEmail = (subj, from) => {
   const combined = `${subj} ${from}`.toLowerCase();
   return DEAL_WORDS.some(k => combined.includes(k));
 };
 
-// ─── IMPROVEMENT 2: BETTER ADDRESS NORMALIZATION ─────────────────────────────
+// ── Property type detection ───────────────────────────────────────────────────
+function detectPropertyType(p) {
+  const text = `${v(p.address)} ${v(p.additional_notes)} ${v(p.highlights)} ${v(p.what_needs_work)}`.toLowerCase();
+  if (/duplex|triplex|fourplex|multi.?family|multi.?unit|apt|apartment/.test(text)) return 'Multi-Family';
+  if (/manufactured|mobile home|modular/.test(text)) return 'Manufactured';
+  if (/commercial|warehouse|retail|office|industrial/.test(text)) return 'Commercial';
+  if (/\blot\b|vacant land|acreage|\bacres\b|land/.test(text) && !p.beds) return 'Land';
+  if (/condo|townhome|townhouse/.test(text)) return 'Condo/Townhome';
+  return 'Single Family';
+}
+
+// ── Address normalization ─────────────────────────────────────────────────────
 function normalizeAddress(addr) {
   if (!addr) return '';
   return addr.toLowerCase()
     .replace(/\./g, '').replace(/,/g, '').replace(/#/g, '')
-    // Full → abbreviated
     .replace(/\bstreet\b/g, 'st').replace(/\bavenue\b/g, 'ave')
     .replace(/\bdrive\b/g, 'dr').replace(/\bboulevard\b/g, 'blvd')
     .replace(/\broad\b/g, 'rd').replace(/\bcourt\b/g, 'ct')
@@ -132,44 +149,50 @@ function normalizeAddress(addr) {
     .replace(/\btrail\b/g, 'trl').replace(/\bway\b/g, 'wy')
     .replace(/\bnorth\b/g, 'n').replace(/\bsouth\b/g, 's')
     .replace(/\beast\b/g, 'e').replace(/\bwest\b/g, 'w')
-    .replace(/\bsaint\b/g, 'st').replace(/\bmt\b/g, 'mount')
-    // Ordinals
-    .replace(/\b1st\b/g, 'first').replace(/\b2nd\b/g, 'second')
-    .replace(/\b3rd\b/g, 'third').replace(/\b4th\b/g, 'fourth')
+    .replace(/\bsaint\b/g, 'st').replace(/\b1st\b/g, 'first')
+    .replace(/\b2nd\b/g, 'second').replace(/\b3rd\b/g, 'third')
     .replace(/\s+/g, ' ').trim();
 }
 
-async function isDuplicate(address, city, zip) {
+// ── Duplicate + price change check ───────────────────────────────────────────
+async function checkDuplicate(address, city, zip, newPrice) {
   if (!address) return { isDupe: false };
   const key = normalizeAddress(`${address} ${city} ${zip}`);
-  const s = getSheets();
   for (const tab of ['Active Deals', 'Deal Storage']) {
-    const res = await s.spreadsheets.values.get({
-      spreadsheetId: SHEET_ID, range: `${tab}!C:F`
-    }).catch(() => null);
+    const res = await sheetsCall(() => getSheets().spreadsheets.values.get({
+      spreadsheetId: SHEET_ID, range: `${tab}!C:AK` // C=Address...AK includes Asking Price col
+    })).catch(() => null);
     const rows = res?.data?.values || [];
+    // headers: C=Address D=City E=State F=Zip ... Asking Price is col 37 (0-indexed from C = index 34)
     for (let i = 1; i < rows.length; i++) {
       const existing = normalizeAddress(`${rows[i][0]} ${rows[i][1]} ${rows[i][3]}`);
-      if (existing && existing === key) return { isDupe: true, tab };
+      if (existing && existing === key) {
+        // Price change detection — col index 34 = Asking Price (C offset)
+        const oldPrice = parseFloat(String(rows[i][34] || '0').replace(/[^0-9.]/g, ''));
+        const np = parseFloat(String(newPrice || '0').replace(/[^0-9.]/g, ''));
+        if (np && oldPrice && Math.abs(np - oldPrice) > 100) {
+          return { isDupe: true, isPriceChange: true, tab, oldPrice, newPrice: np };
+        }
+        return { isDupe: true, isPriceChange: false, tab };
+      }
     }
   }
   return { isDupe: false };
 }
 
-// ─── IMPROVEMENT 5: STRIP EMAIL FOOTERS ──────────────────────────────────────
+// ── Footer stripper ───────────────────────────────────────────────────────────
 function stripFooters(text) {
   if (!text) return '';
-  // Common footer markers — cut everything after these
   const cutMarkers = [
     /^unsubscribe/im, /^to unsubscribe/im, /^you (are|were) receiving/im,
     /^this email was sent/im, /^you received this/im, /^if you no longer/im,
     /^confidentiality notice/im, /^disclaimer:/im, /^legal notice/im,
-    /^this message (is|was) sent/im, /^remove me/im, /^manage (your )?preferences/im,
-    /^privacy policy/im, /^view in browser/im, /^having trouble viewing/im,
+    /^this message (is|was) sent/im, /^remove me/im,
+    /^manage (your )?preferences/im, /^privacy policy/im,
+    /^view in browser/im, /^having trouble viewing/im,
     /^update your email preferences/im, /^©\s*20/im,
     /^sent from my/im, /^get outlook for/im
   ];
-
   const lines = text.split('\n');
   for (let i = 0; i < lines.length; i++) {
     if (cutMarkers.some(rx => rx.test(lines[i].trim()))) {
@@ -179,20 +202,17 @@ function stripFooters(text) {
   return text.trim();
 }
 
-// ─── IMPROVEMENT 6: BRAIN-INFORMED EXTRACTION ────────────────────────────────
+// ── Brain context ─────────────────────────────────────────────────────────────
 async function getBrainContext(fromEmail) {
-  const s = getSheets();
-  const res = await s.spreadsheets.values.get({
+  const res = await sheetsCall(() => getSheets().spreadsheets.values.get({
     spreadsheetId: SHEET_ID, range: "Derek's Brain!A:J"
-  }).catch(() => null);
+  })).catch(() => null);
   const rows = res?.data?.values || [];
   for (let i = 1; i < rows.length; i++) {
     if (rows[i][0] === fromEmail) {
       return {
-        formatType: rows[i][4] || '',
-        typicalFields: rows[i][5] || '',
-        whatWorks: rows[i][6] || '',
-        watchOutFor: rows[i][7] || '',
+        formatType: rows[i][4] || '', typicalFields: rows[i][5] || '',
+        whatWorks: rows[i][6] || '', watchOutFor: rows[i][7] || '',
         timesSent: parseInt(rows[i][3] || '0')
       };
     }
@@ -200,42 +220,41 @@ async function getBrainContext(fromEmail) {
   return null;
 }
 
-// ─── EXTRACTION ───────────────────────────────────────────────────────────────
+// ── Extraction ────────────────────────────────────────────────────────────────
 async function extractProperties(from, subject, body) {
-  // Improvement 5: strip footer before sending
   const cleanBody = stripFooters(body);
-
-  // Improvement 6: get brain context for this sender
   const brain = await getBrainContext(from);
   let brainHint = '';
   if (brain && brain.timesSent > 0) {
-    brainHint = `\n\nKNOWN SENDER INTELLIGENCE (${brain.timesSent} emails seen):
+    brainHint = `\n\nKNOWN SENDER (${brain.timesSent} emails seen):
 - Format: ${brain.formatType}
 - What works: ${brain.whatWorks}
 - Watch out for: ${brain.watchOutFor}
-- Typical fields present: ${brain.typicalFields}
-Use this to improve your extraction accuracy.`;
+Use this context to improve extraction accuracy.`;
   }
 
   const prompt = `You are a real estate data extraction engine for Coralstone Capital Group.
-Extract EVERY property from this wholesale deal email. Return a JSON array — one object per property. Miss nothing.${brainHint}
+Extract EVERY property from this wholesale deal email. Return a JSON array — one object per property.${brainHint}
 
 Each object must have ALL these fields (null if not found):
 address, city, state, zip, county, subdivision,
-beds, baths, half_baths, sqft, lot_sqft, lot_acres, year_built, stories,
+beds (number), baths (number), half_baths (number),
+sqft (number), lot_sqft (number), lot_acres (number),
+year_built (number), stories (number),
 construction, foundation, pool, pool_notes, garage, garage_spaces,
 carport, basement, attic, overall_condition,
 roof_type, roof_age, ac_year, water_heater, electrical, plumbing, windows, flooring,
 kitchen_notes, bath_notes,
-asking_price (number only), arv (number only), repairs_estimate (number only),
-assignment_fee (number only), equity, rent_current, rent_market,
-annual_taxes (number only), hoa_fee,
+asking_price (number — search for "asking", "price", "sales price", dollar amounts),
+arv (number — search for "ARV", "after repair value", "after repairs", "retail value"),
+repairs_estimate (number), assignment_fee (number), equity,
+rent_current, rent_market, annual_taxes (number), hoa_fee,
 close_date, inspection_period, earnest_money, financing_terms, cash_only,
 contact_1_name, contact_1_title, contact_1_company,
 contact_1_phone, contact_1_phone_2, contact_1_email, contact_1_website,
 contact_2_name, contact_2_title, contact_2_company, contact_2_phone, contact_2_email,
 contact_3_name, contact_3_phone, contact_3_email,
-all_phones, all_emails, all_names,
+all_phones (ALL phone numbers found anywhere), all_emails (ALL emails found anywhere), all_names,
 seller_name, seller_phone, seller_situation, seller_motivation, occupancy,
 flood_zone, hoa, school_district,
 drive_link, zillow_link, google_maps_link, all_other_links,
@@ -249,11 +268,10 @@ SUBJECT: ${subject}
 BODY:
 ${cleanBody.slice(0, 12000)}
 
-Return ONLY a valid JSON array. No markdown. No explanation.`;
+Return ONLY a valid JSON array. No markdown.`;
 
   const res = await anthropic.messages.create({
-    model: 'claude-haiku-4-5-20251001',
-    max_tokens: 4000,
+    model: 'claude-haiku-4-5-20251001', max_tokens: 4000,
     messages: [{ role: 'user', content: prompt }]
   });
 
@@ -268,12 +286,12 @@ Return ONLY a valid JSON array. No markdown. No explanation.`;
   }
 }
 
-// ─── ROW BUILDER ─────────────────────────────────────────────────────────────
-function buildRow(p, subject, uid) {
+// ── Row builder ───────────────────────────────────────────────────────────────
+function buildRow(p, subject, uid, propertyType) {
   const now = new Date();
   const expires = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
   return [
-    now.toISOString(), expires.toISOString(),
+    now.toISOString(), expires.toISOString(), propertyType,
     v(p.address), v(p.city), v(p.state), v(p.zip), v(p.county), v(p.subdivision),
     v(p.beds), v(p.baths), v(p.half_baths), v(p.sqft), v(p.lot_sqft), v(p.lot_acres),
     v(p.year_built), v(p.stories), v(p.construction), v(p.foundation),
@@ -303,138 +321,123 @@ function buildRow(p, subject, uid) {
   ];
 }
 
-// ─── SHEET INIT ───────────────────────────────────────────────────────────────
+// ── Sheet init ────────────────────────────────────────────────────────────────
 async function initSheet() {
   const s = getSheets();
-  const activeCheck = await s.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID, range: 'Active Deals!A1:A1'
-  }).catch(() => null);
-  const hasHeaders = activeCheck?.data?.values?.[0]?.[0] === 'Date Received';
-  const hasData = !!(await s.spreadsheets.values.get({
+  const activeCheck = await sheetsCall(() => s.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID, range: 'Active Deals!A1:C1'
+  })).catch(() => null);
+  const firstCell = activeCheck?.data?.values?.[0]?.[0];
+  const hasPropertyType = activeCheck?.data?.values?.[0]?.[2] === 'Property Type';
+  const hasData = !!(await sheetsCall(() => s.spreadsheets.values.get({
     spreadsheetId: SHEET_ID, range: 'Active Deals!A2:A2'
-  }).catch(() => null))?.data?.values;
+  })).catch(() => null))?.data?.values;
 
-  if (!hasHeaders) {
-    await s.spreadsheets.values.clear({ spreadsheetId: SHEET_ID, range: 'Active Deals' }).catch(() => {});
-    await s.spreadsheets.values.update({
+  if (firstCell !== 'Date Received' || !hasPropertyType) {
+    await sheetsCall(() => s.spreadsheets.values.clear({ spreadsheetId: SHEET_ID, range: 'Active Deals' }));
+    await sheetsCall(() => s.spreadsheets.values.update({
       spreadsheetId: SHEET_ID, range: 'Active Deals!A1',
       valueInputOption: 'RAW', requestBody: { values: [ACTIVE_HEADERS] }
-    });
-    seen = new Set(); await saveSeen();
+    }));
+    seen = new Set(); seenSheetReady = false;
     console.log(`Sheet initialized: ${ACTIVE_HEADERS.length} columns`);
   } else if (!hasData) {
-    seen = new Set(); await saveSeen();
+    seen = new Set(); seenSheetReady = false;
     console.log('Sheet empty — resetting seen IDs');
   } else {
     console.log('Sheet has data — resuming');
   }
 
-  // Deal Storage tab
-  const storageCheck = await s.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID, range: 'Deal Storage!A1:A1'
-  }).catch(() => null);
-  if (!storageCheck?.data?.values?.[0]?.[0]) {
-    await s.spreadsheets.values.update({
-      spreadsheetId: SHEET_ID, range: 'Deal Storage!A1',
-      valueInputOption: 'RAW', requestBody: { values: [ACTIVE_HEADERS] }
-    });
-  }
-
-  // Errors tab — improvement 3
-  const errCheck = await s.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID, range: 'Errors!A1:A1'
-  }).catch(() => null);
-  if (!errCheck?.data?.values?.[0]?.[0]) {
-    await s.spreadsheets.values.update({
-      spreadsheetId: SHEET_ID, range: 'Errors!A1',
-      valueInputOption: 'RAW', requestBody: { values: [['Date', 'From', 'Subject', 'UID', 'Error']] }
-    });
-    console.log('Errors tab initialized');
-  }
-
-  // Seen UIDs tab (persistent across restarts)
-  const seenCheck = await s.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID, range: 'Seen!A1:A1'
-  }).catch(() => null);
-  if (!seenCheck?.data?.values?.[0]?.[0]) {
-    await s.spreadsheets.values.update({
-      spreadsheetId: SHEET_ID, range: 'Seen!A1',
-      valueInputOption: 'RAW', requestBody: { values: [['Email UID']] }
-    });
-    console.log('Seen tab initialized');
-  }
-
-  // Derek's Brain tab
-  const brainCheck = await s.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID, range: "Derek's Brain!A1:A1"
-  }).catch(() => null);
-  if (!brainCheck?.data?.values?.[0]?.[0]) {
-    await s.spreadsheets.values.update({
-      spreadsheetId: SHEET_ID, range: "Derek's Brain!A1",
-      valueInputOption: 'RAW', requestBody: { values: [BRAIN_HEADERS] }
-    });
-    console.log("Derek's Brain initialized");
+  for (const [tab, headers] of [
+    ['Deal Storage', ACTIVE_HEADERS],
+    ['Price Changes', PRICE_CHANGE_HEADERS],
+    ['Errors', ['Date', 'From', 'Subject', 'UID', 'Error']],
+    ["Derek's Brain", BRAIN_HEADERS],
+    ['Seen', ['Email UID']]
+  ]) {
+    const check = await sheetsCall(() => s.spreadsheets.values.get({
+      spreadsheetId: SHEET_ID, range: `${tab}!A1:A1`
+    })).catch(() => null);
+    if (!check?.data?.values?.[0]?.[0]) {
+      await sheetsCall(() => s.spreadsheets.values.update({
+        spreadsheetId: SHEET_ID, range: `${tab}!A1`,
+        valueInputOption: 'RAW', requestBody: { values: [headers] }
+      }));
+      console.log(`${tab} tab initialized`);
+    }
   }
 }
 
-// ─── IMPROVEMENT 3: LOG ERRORS TO SHEET ──────────────────────────────────────
+// ── Error logging ─────────────────────────────────────────────────────────────
 async function logError(from, subject, uid, error) {
-  const s = getSheets();
-  await s.spreadsheets.values.append({
+  await sheetsCall(() => getSheets().spreadsheets.values.append({
     spreadsheetId: SHEET_ID, range: 'Errors!A:A',
     valueInputOption: 'RAW',
     requestBody: { values: [[new Date().toISOString(), from, subject, uid, error]] }
-  }).catch(() => {});
-  console.log(`⚠️ Error logged to sheet: ${error}`);
+  })).catch(() => {});
+  console.log(`⚠️ Logged to Errors tab: ${error}`);
 }
 
-// ─── AUTO-ARCHIVE (7 days) ────────────────────────────────────────────────────
+// ── Price change logger ───────────────────────────────────────────────────────
+async function logPriceChange(p, subject, oldPrice, newPrice) {
+  const change = newPrice - oldPrice;
+  const changePct = oldPrice ? ((change / oldPrice) * 100).toFixed(1) : '?';
+  await sheetsCall(() => getSheets().spreadsheets.values.append({
+    spreadsheetId: SHEET_ID, range: 'Price Changes!A:A',
+    valueInputOption: 'RAW',
+    requestBody: { values: [[
+      new Date().toISOString(),
+      v(p.address), v(p.city), v(p.state), v(p.zip),
+      oldPrice, newPrice, change, `${changePct}%`,
+      v(p.arv), v(p.contact_1_name), v(p.contact_1_phone), v(p.contact_1_email),
+      v(p.wholesaler_company), subject
+    ]] }
+  }));
+  const arrow = change < 0 ? '📉' : '📈';
+  console.log(`  ${arrow} Price change: ${p.address} $${oldPrice} → $${newPrice} (${changePct}%)`);
+}
+
+// ── Auto-archive ──────────────────────────────────────────────────────────────
 async function archiveExpired() {
-  const s = getSheets();
-  const res = await s.spreadsheets.values.get({
+  const res = await sheetsCall(() => getSheets().spreadsheets.values.get({
     spreadsheetId: SHEET_ID, range: 'Active Deals!A:CZ'
-  }).catch(() => null);
+  })).catch(() => null);
   const rows = res?.data?.values || [];
   if (rows.length <= 1) return;
 
-  const now = new Date();
-  const headers = rows[0];
-  const active = [headers];
-  const expired = [];
-
+  const now = new Date(), headers = rows[0];
+  const active = [headers], expired = [];
   for (let i = 1; i < rows.length; i++) {
     const expires = rows[i][1];
     if (expires && new Date(expires) < now) expired.push(rows[i]);
     else active.push(rows[i]);
   }
-
   if (expired.length === 0) return;
 
-  await s.spreadsheets.values.clear({ spreadsheetId: SHEET_ID, range: 'Active Deals!A:CZ' });
-  await s.spreadsheets.values.update({
+  await sheetsCall(() => getSheets().spreadsheets.values.clear({ spreadsheetId: SHEET_ID, range: 'Active Deals!A:CZ' }));
+  await sheetsCall(() => getSheets().spreadsheets.values.update({
     spreadsheetId: SHEET_ID, range: 'Active Deals!A1',
     valueInputOption: 'RAW', requestBody: { values: active }
-  });
-  await s.spreadsheets.values.append({
+  }));
+  await sheetsCall(() => getSheets().spreadsheets.values.append({
     spreadsheetId: SHEET_ID, range: 'Deal Storage!A:A',
     valueInputOption: 'RAW', requestBody: { values: expired }
-  });
+  }));
   console.log(`📦 Archived ${expired.length} expired deal(s)`);
 }
 
-// ─── DEREK'S BRAIN UPDATE ────────────────────────────────────────────────────
+// ── Derek's Brain update ──────────────────────────────────────────────────────
 async function updateBrain(fromEmail, company, subject, propertyCount, body) {
-  const s = getSheets();
-  const res = await s.spreadsheets.values.get({
+  const res = await sheetsCall(() => getSheets().spreadsheets.values.get({
     spreadsheetId: SHEET_ID, range: "Derek's Brain!A:J"
-  }).catch(() => null);
+  })).catch(() => null);
   const rows = res?.data?.values || [];
   const now = new Date().toISOString();
 
   const hasEmoji = /[\u{1F300}-\u{1FFFF}]/u.test(body);
   const hasBullets = /^[-•*]/m.test(body);
   const hasNumbered = /^\d+\./m.test(body);
-  const hasTable = body.includes('\t') || / \| /.test(body);
+  const hasTable = / \| /.test(body);
   const formatType = hasEmoji ? 'Emoji bullets' : hasNumbered ? 'Numbered list'
     : hasBullets ? 'Bullet list' : hasTable ? 'Table' : 'Plain text';
 
@@ -444,67 +447,70 @@ async function updateBrain(fromEmail, company, subject, propertyCount, body) {
   }
 
   if (existingRow > 0) {
-    const existing = rows[existingRow - 1];
-    const timesSent = parseInt(existing[3] || '0') + 1;
-    const prevAvgRaw = parseFloat(existing[8] || '0');
-    const prevAvg = isNaN(prevAvgRaw) ? 0 : prevAvgRaw;
+    const ex = rows[existingRow - 1];
+    const timesSent = parseInt(ex[3] || '0') + 1;
+    const prevAvg = isNaN(parseFloat(ex[8])) ? 0 : parseFloat(ex[8]);
     const avgProps = ((prevAvg * (timesSent - 1)) + propertyCount) / timesSent;
-
-    await s.spreadsheets.values.update({
+    await sheetsCall(() => getSheets().spreadsheets.values.update({
       spreadsheetId: SHEET_ID, range: `Derek's Brain!A${existingRow}`,
       valueInputOption: 'RAW', requestBody: { values: [[
-        fromEmail, company || existing[1] || '', now, timesSent,
-        formatType, existing[5] || '', existing[6] || '',
-        existing[7] || '', avgProps.toFixed(1), existing[9] || ''
+        fromEmail, company || ex[1] || '', now, timesSent,
+        formatType, ex[5] || '', ex[6] || '', ex[7] || '',
+        avgProps.toFixed(1), ex[9] || ''
       ]] }
-    });
-    console.log(`🧠 Brain: ${fromEmail} updated (${timesSent} emails, avg ${avgProps.toFixed(1)} props)`);
+    }));
+    console.log(`🧠 Brain: ${fromEmail} (${timesSent} emails, avg ${avgProps.toFixed(1)} props)`);
   } else {
-    await s.spreadsheets.values.append({
+    await sheetsCall(() => getSheets().spreadsheets.values.append({
       spreadsheetId: SHEET_ID, range: "Derek's Brain!A:A",
       valueInputOption: 'RAW', requestBody: { values: [[
         fromEmail, company || '', now, 1, formatType,
         'address, beds, baths, sqft, asking, arv, drive link, phone',
-        'Check for Google Drive links per property',
-        '', propertyCount.toString(), `First seen: ${subject}`
+        'Check for Google Drive links per property', '',
+        propertyCount.toString(), `First seen: ${subject}`
       ]] }
-    });
-    console.log(`🧠 Brain: new wholesaler logged — ${fromEmail}`);
+    }));
+    console.log(`🧠 Brain: new wholesaler — ${fromEmail}`);
   }
 }
 
-async function appendRow(row) {
-  const s = getSheets();
-  await s.spreadsheets.values.append({
-    spreadsheetId: SHEET_ID, range: 'Active Deals!A:A',
-    valueInputOption: 'RAW', requestBody: { values: [row] }
-  });
+// ── IMAP connect with retry ───────────────────────────────────────────────────
+async function connectImap(retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    const client = new ImapFlow({
+      host: process.env.IMAP_HOST, port: 993, secure: true,
+      auth: { user: process.env.IMAP_USER, pass: process.env.IMAP_PASSWORD },
+      logger: false, socketTimeout: 120000, connectionTimeout: 60000,
+      tls: { rejectUnauthorized: false }
+    });
+    client.on('error', e => console.error('IMAP socket error (handled):', e.message));
+    try {
+      await client.connect();
+      return client;
+    } catch (e) {
+      if (i === retries - 1) throw e;
+      console.error(`IMAP connect failed (retry ${i+1}/${retries-1}):`, e.message);
+      await new Promise(r => setTimeout(r, 3000));
+    }
+  }
 }
 
-// ─── MAIN POLL ────────────────────────────────────────────────────────────────
+// ── Main poll ─────────────────────────────────────────────────────────────────
 async function poll() {
   console.log(`\n[${new Date().toLocaleTimeString()}] Polling ${process.env.IMAP_USER}...`);
   await archiveExpired();
 
-  const client = new ImapFlow({
-    host: process.env.IMAP_HOST, port: 993, secure: true,
-    auth: { user: process.env.IMAP_USER, pass: process.env.IMAP_PASSWORD },
-    logger: false, socketTimeout: 120000, connectionTimeout: 60000,
-    tls: { rejectUnauthorized: false }
-  });
-  client.on('error', e => console.error('IMAP err (handled):', e.message));
-
-  let written = 0, dupes = 0, skipped = 0, errors = 0;
+  let client;
+  let written = 0, dupes = 0, priceChanges = 0, errors = 0;
 
   try {
-    await client.connect();
+    client = await connectImap();
     const lock = await client.getMailboxLock('INBOX');
 
     try {
-      // Improvement 4: 7-day lookback instead of 72 hours
       const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
 
-      // Phase 1: envelopes only — zero cost
+      // Phase 1: envelopes only
       const candidates = [];
       for await (const msg of client.fetch({ since }, { envelope: true, uid: true })) {
         const uid = String(msg.uid);
@@ -527,7 +533,6 @@ async function poll() {
 
           const properties = await extractProperties(c.from, c.subj, rawBody);
 
-          // Improvement 3: log failed extractions
           if (!properties || properties.length === 0) {
             console.log('  → No properties extracted');
             await logError(c.from, c.subj, c.uid, 'Extraction returned 0 properties');
@@ -539,13 +544,23 @@ async function poll() {
 
             for (const p of properties) {
               if (!p.address) { console.log('  → Skipped (no address)'); continue; }
-              const dupeCheck = await isDuplicate(p.address, p.city, p.zip);
-              if (dupeCheck.isDupe) {
-                console.log(`  🔁 DUPE: ${p.address} (already in ${dupeCheck.tab})`);
+
+              const propertyType = detectPropertyType(p);
+              const dupeCheck = await checkDuplicate(p.address, p.city, p.zip, p.asking_price);
+
+              if (dupeCheck.isDupe && dupeCheck.isPriceChange) {
+                await logPriceChange(p, c.subj, dupeCheck.oldPrice, dupeCheck.newPrice);
+                priceChanges++;
+              } else if (dupeCheck.isDupe) {
+                console.log(`  🔁 DUPE: ${p.address} (in ${dupeCheck.tab})`);
                 dupes++;
               } else {
-                await appendRow(buildRow(p, c.subj, c.uid));
-                console.log(`  ✅ ${p.address}, ${p.city} | Ask: $${p.asking_price} | ARV: $${p.arv}`);
+                await sheetsCall(() => getSheets().spreadsheets.values.append({
+                  spreadsheetId: SHEET_ID, range: 'Active Deals!A:A',
+                  valueInputOption: 'RAW',
+                  requestBody: { values: [buildRow(p, c.subj, c.uid, propertyType)] }
+                }));
+                console.log(`  ✅ [${propertyType}] ${p.address}, ${p.city} | Ask: $${p.asking_price} | ARV: $${p.arv}`);
                 written++;
               }
               await new Promise(r => setTimeout(r, 300));
@@ -565,19 +580,18 @@ async function poll() {
       }
     } finally { lock.release(); }
 
-    console.log(`\n✅ Poll done — ${written} new | ${dupes} dupes | ${errors} errors | ${skipped} skipped`);
+    console.log(`\n✅ Poll done — ${written} new | ${dupes} dupes | ${priceChanges} price changes | ${errors} errors`);
   } catch (e) {
     console.error('Poll error:', e.message);
   } finally {
-    try { await client.logout(); } catch {}
+    if (client) { try { await client.logout(); } catch {} }
   }
 }
 
-// ─── BOOT ─────────────────────────────────────────────────────────────────────
+// ── Boot ──────────────────────────────────────────────────────────────────────
 const POLL_MS = parseInt(process.env.POLL_INTERVAL || '300000');
 console.log(`🤙 Derek | ${process.env.IMAP_USER} | every ${POLL_MS / 60000}min`);
-console.log(`✓ Extended keywords | ✓ Better dupe detection | ✓ Error logging`);
-console.log(`✓ 7-day lookback | ✓ Footer stripping | ✓ Brain-informed extraction`);
+console.log(`✓ Price changes | ✓ Sheets retry | ✓ Property type | ✓ IMAP reconnect`);
 
 initSheet()
   .then(() => loadSeenFromSheet())
