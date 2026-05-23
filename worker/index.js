@@ -398,6 +398,69 @@ async function logPriceChange(p, subject, oldPrice, newPrice) {
   console.log(`  ${arrow} Price change: ${p.address} $${oldPrice} → $${newPrice} (${changePct}%)`);
 }
 
+// ── Process checkboxes (Pass / Sold) ─────────────────────────────────────────
+async function processCheckboxes() {
+  const s = getSheets();
+  const res = await sheetsCall(() => s.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID, range: 'Active Deals!A:CZ'
+  })).catch(() => null);
+  const rows = res?.data?.values || [];
+  if (rows.length <= 1) return;
+
+  const headers = rows[0];
+  const keep = [headers];
+  const passed = [];
+  const sold = [];
+
+  // B=Pass (index 1), C=Sold (index 2)
+  for (let i = 1; i < rows.length; i++) {
+    const isPass = rows[i][1] === 'TRUE' || rows[i][1] === true;
+    const isSold = rows[i][2] === 'TRUE' || rows[i][2] === true;
+    if (isPass) {
+      passed.push(rows[i]);
+    } else if (isSold) {
+      const soldRow = [...rows[i]];
+      soldRow[1] = false; // clear Pass
+      soldRow[2] = false; // clear Sold
+      sold.push(soldRow);
+    } else {
+      keep.push(rows[i]);
+    }
+  }
+
+  if (passed.length === 0 && sold.length === 0) return;
+
+  // Rewrite Active Deals without passed/sold rows
+  await sheetsCall(() => s.spreadsheets.values.clear({ spreadsheetId: SHEET_ID, range: 'Active Deals!A:CZ' }));
+  await sheetsCall(() => s.spreadsheets.values.update({
+    spreadsheetId: SHEET_ID, range: 'Active Deals!A1',
+    valueInputOption: 'RAW', requestBody: { values: keep }
+  }));
+
+  // Archive passed rows to Deal Storage
+  if (passed.length > 0) {
+    await sheetsCall(() => s.spreadsheets.values.append({
+      spreadsheetId: SHEET_ID, range: 'Deal Storage!A:A',
+      valueInputOption: 'RAW', requestBody: { values: passed }
+    }));
+    console.log(`🗑️  Moved ${passed.length} PASS deal(s) to Deal Storage`);
+  }
+
+  // Archive sold rows to Deal Storage with SOLD tag in Review column (D, index 3)
+  if (sold.length > 0) {
+    const taggedSold = sold.map(r => {
+      const row = [...r];
+      row[3] = 'SOLD'; // mark Review column
+      return row;
+    });
+    await sheetsCall(() => s.spreadsheets.values.append({
+      spreadsheetId: SHEET_ID, range: 'Deal Storage!A:A',
+      valueInputOption: 'RAW', requestBody: { values: taggedSold }
+    }));
+    console.log(`🏠 Moved ${sold.length} SOLD deal(s) to Deal Storage`);
+  }
+}
+
 // ── Auto-archive ──────────────────────────────────────────────────────────────
 async function archiveExpired() {
   const res = await sheetsCall(() => getSheets().spreadsheets.values.get({
