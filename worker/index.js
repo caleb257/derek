@@ -358,7 +358,8 @@ async function initSheet() {
     const check = await sheetsCall(() => s.spreadsheets.values.get({
       spreadsheetId: SHEET_ID, range: `${tab}!A1:A1`
     })).catch(() => null);
-    if (!check?.data?.values?.[0]?.[0]) {
+    const existingHeader = check?.data?.values?.[0]?.[0];
+    if (!existingHeader || existingHeader !== headers[0]) {
       await sheetsCall(() => s.spreadsheets.values.update({
         spreadsheetId: SHEET_ID, range: `${tab}!A1`,
         valueInputOption: 'RAW', requestBody: { values: [headers] }
