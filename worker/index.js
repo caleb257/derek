@@ -62,7 +62,7 @@ async function saveSeen() {
 
 // ── Headers ───────────────────────────────────────────────────────────────────
 const ACTIVE_HEADERS = [
-  'Date Received', 'Expires', 'Property Type',
+  'Date Received', 'Pass', 'Sold', 'Review', 'Expires', 'Property Type',
   'Address', 'City', 'State', 'Zip', 'County', 'Subdivision',
   'Beds', 'Baths', 'Half Baths', 'Sqft', 'Lot Sqft', 'Lot Acres', 'Year Built', 'Stories',
   'Construction', 'Foundation', 'Pool', 'Pool Notes', 'Garage', 'Garage Spaces',
@@ -291,7 +291,7 @@ function buildRow(p, subject, uid, propertyType) {
   const now = new Date();
   const expires = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
   return [
-    now.toISOString(), expires.toISOString(), propertyType,
+    now.toISOString(), false, false, false, expires.toISOString(), propertyType,
     v(p.address), v(p.city), v(p.state), v(p.zip), v(p.county), v(p.subdivision),
     v(p.beds), v(p.baths), v(p.half_baths), v(p.sqft), v(p.lot_sqft), v(p.lot_acres),
     v(p.year_built), v(p.stories), v(p.construction), v(p.foundation),
@@ -475,6 +475,59 @@ async function updateBrain(fromEmail, company, subject, propertyCount, body) {
   }
 }
 
+// ── Checkbox processor (Pass/Sold → archive) ─────────────────────────────────
+async function processCheckboxes() {
+  const s = getSheets();
+  const res = await sheetsCall(() => s.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID, range: 'Active Deals!A:CZ'
+  })).catch(() => null);
+  const rows = res?.data?.values || [];
+  if (rows.length <= 1) return;
+
+  const headers = rows[0];
+  const keep = [headers];
+  const toArchive = [];
+  let passed = 0, sold = 0;
+
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i];
+    const isPass = row[1] === 'TRUE' || row[1] === true;
+    const isSold = row[2] === 'TRUE' || row[2] === true;
+
+    if (isPass) {
+      // Mark as PASS in the archived copy
+      const archived = [...row];
+      archived[1] = 'PASS';
+      toArchive.push(archived);
+      passed++;
+    } else if (isSold) {
+      const archived = [...row];
+      archived[2] = 'SOLD';
+      toArchive.push(archived);
+      sold++;
+    } else {
+      keep.push(row);
+    }
+  }
+
+  if (toArchive.length === 0) return;
+
+  // Rewrite Active Deals without the archived rows
+  await sheetsCall(() => s.spreadsheets.values.clear({ spreadsheetId: SHEET_ID, range: 'Active Deals!A:CZ' }));
+  await sheetsCall(() => s.spreadsheets.values.update({
+    spreadsheetId: SHEET_ID, range: 'Active Deals!A1',
+    valueInputOption: 'RAW', requestBody: { values: keep }
+  }));
+  // Append to Deal Storage
+  await sheetsCall(() => s.spreadsheets.values.append({
+    spreadsheetId: SHEET_ID, range: 'Deal Storage!A:A',
+    valueInputOption: 'RAW', requestBody: { values: toArchive }
+  }));
+
+  if (passed > 0) console.log(`❌ Passed ${passed} deal(s) → Deal Storage`);
+  if (sold > 0) console.log(`🤝 Sold ${sold} deal(s) → Deal Storage`);
+}
+
 // ── IMAP connect with retry ───────────────────────────────────────────────────
 async function connectImap(retries = 3) {
   for (let i = 0; i < retries; i++) {
@@ -500,6 +553,9 @@ async function connectImap(retries = 3) {
 async function poll() {
   console.log(`\n[${new Date().toLocaleTimeString()}] Polling ${process.env.IMAP_USER}...`);
   await archiveExpired();
+
+  // Process Pass/Sold checkboxes before polling IMAP
+  await processCheckboxes();
 
   let client;
   let written = 0, dupes = 0, priceChanges = 0, errors = 0;
