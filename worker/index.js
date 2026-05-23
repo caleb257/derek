@@ -88,7 +88,7 @@ const ACTIVE_HEADERS = [
   'Photos Included', 'Photo Count', 'Photo Links',
   'Comp 1', 'Comp 2', 'Comp 3',
   'What Is Updated', 'What Needs Work', 'Highlights', 'Red Flags', 'Additional Notes',
-  'Wholesaler Company', 'List Name', 'Email Subject', 'Email UID'
+  'Wholesaler Company', 'List Name', 'Days Active', 'Email Subject', 'Email UID'
 ];
 
 // Column index lookups (0-based) — derived from ACTIVE_HEADERS so they never drift
@@ -313,6 +313,7 @@ function buildRow(p, subject, uid, propertyType) {
     v(p.comp_1), v(p.comp_2), v(p.comp_3),
     v(p.what_is_updated), v(p.what_needs_work), v(p.highlights), v(p.red_flags), v(p.additional_notes),
     v(p.wholesaler_company), v(p.list_name),
+    '0',
     v(subject), v(uid)
   ];
 }
@@ -345,7 +346,8 @@ async function initSheet() {
     ['Price Changes', PRICE_CHANGE_HEADERS],
     ['Errors', ['Date','From','Subject','UID','Error']],
     ["Derek's Brain", BRAIN_HEADERS],
-    ['Seen', ['Email UID']]
+    ['Seen', ['Email UID']],
+    ['Wholesaler Directory', ['Company', 'Contact Name', 'Email', 'Phone', 'Website', 'Deals Sent', 'Avg Properties/Email', 'Last Deal Date', 'Property Types', 'Avg Asking Price', 'Notes']]
   ]) {
     const check = await sc(() => s.spreadsheets.values.get({
       spreadsheetId: SHEET_ID, range: `${tab}!A1:A1`
@@ -409,6 +411,58 @@ async function processCheckboxes() {
   }
 }
 
+// ── UPDATE DAYS ACTIVE ────────────────────────────────────────────────────────
+async function updateDaysActive() {
+  const s = getSheets();
+  const res = await sc(() => s.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID, range: 'Active Deals!A:CZ'
+  })).catch(() => null);
+  const rows = res?.data?.values || [];
+  if (rows.length <= 1) return;
+
+  const dateIdx = COL['Date Received'];  // A = 0
+  const daysIdx = COL['Days Active'];
+  const now = new Date();
+  let updated = 0;
+
+  // Build batch update
+  const updates = [];
+  for (let i = 1; i < rows.length; i++) {
+    const received = rows[i][dateIdx];
+    if (!received) continue;
+    const days = Math.floor((now - new Date(received)) / (1000*60*60*24));
+    const currentDays = parseInt(rows[i][daysIdx] || '-1');
+    if (days !== currentDays) {
+      updates.push({ row: i+1, days });
+    }
+  }
+
+  if (updates.length === 0) return;
+
+  // Write all Days Active updates in one batch
+  // Convert 0-based index to spreadsheet column letter (A, B, ..., Z, AA, AB...)
+  function colLetter(idx) {
+    let letter = '';
+    idx += 1; // 1-based
+    while (idx > 0) {
+      const rem = (idx - 1) % 26;
+      letter = String.fromCharCode(65 + rem) + letter;
+      idx = Math.floor((idx - 1) / 26);
+    }
+    return letter;
+  }
+  const colLetter_daysActive = colLetter(daysIdx);
+  const data = updates.map(u => ({
+    range: `Active Deals!${colLetter_daysActive}${u.row}`,
+    values: [[u.days]]
+  }));
+  await sc(() => s.spreadsheets.values.batchUpdate({
+    spreadsheetId: SHEET_ID,
+    requestBody: { valueInputOption: 'RAW', data }
+  }));
+  console.log(`📅 Days Active updated for ${updates.length} row(s)`);
+}
+
 // ── AUTO-ARCHIVE ──────────────────────────────────────────────────────────────
 async function archiveExpired() {
   const res = await sc(() => getSheets().spreadsheets.values.get({
@@ -465,6 +519,62 @@ async function logError(from, subject, uid, error) {
     requestBody: { values: [[new Date().toISOString(), from, subject, uid, error]] }
   })).catch(() => {});
   console.log(`⚠️ Error logged: ${error}`);
+}
+
+// ── WHOLESALER DIRECTORY ─────────────────────────────────────────────────────
+async function updateWholesalerDirectory(fromEmail, company, contactName, phone, website, propertyType, askingPrice) {
+  const s = getSheets();
+  const res = await sc(() => s.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID, range: 'Wholesaler Directory!A:K'
+  })).catch(() => null);
+  const rows = res?.data?.values || [];
+
+  const now = new Date().toISOString().split('T')[0]; // date only
+  let existingRow = -1;
+  for (let i = 1; i < rows.length; i++) {
+    // Match by email (col B=1) or company (col A=0)
+    if (rows[i][1] === fromEmail || (company && rows[i][0] === company)) {
+      existingRow = i + 1; break;
+    }
+  }
+
+  if (existingRow > 0) {
+    const ex = rows[existingRow - 1];
+    const deals = parseInt(ex[5] || '0') + 1;
+    const prevAvg = isNaN(parseFloat(ex[6])) ? 0 : parseFloat(ex[6]);
+    // Update property types — accumulate unique types
+    const existingTypes = (ex[8] || '').split(',').map(t => t.trim()).filter(Boolean);
+    if (propertyType && !existingTypes.includes(propertyType)) existingTypes.push(propertyType);
+    // Running avg asking price
+    const prevAvgAsk = isNaN(parseFloat(ex[9])) ? 0 : parseFloat(ex[9]);
+    const newAvgAsk = askingPrice ? ((prevAvgAsk * (deals-1)) + parseFloat(askingPrice)) / deals : prevAvgAsk;
+
+    await sc(() => s.spreadsheets.values.update({
+      spreadsheetId: SHEET_ID, range: `Wholesaler Directory!A${existingRow}`,
+      valueInputOption: 'RAW', requestBody: { values: [[
+        company || ex[0] || '',
+        fromEmail,
+        contactName || ex[2] || '',
+        phone || ex[3] || '',
+        website || ex[4] || '',
+        deals,
+        prevAvg.toFixed(1), // avg props per email — updated by Brain
+        now,
+        existingTypes.join(', '),
+        newAvgAsk ? Math.round(newAvgAsk).toString() : ex[9] || '',
+        ex[10] || ''
+      ]] }
+    }));
+  } else {
+    await sc(() => s.spreadsheets.values.append({
+      spreadsheetId: SHEET_ID, range: 'Wholesaler Directory!A:A',
+      valueInputOption: 'RAW', requestBody: { values: [[
+        company || '', fromEmail, contactName || '', phone || '',
+        website || '', 1, '1.0', now, propertyType || '', askingPrice ? String(Math.round(parseFloat(askingPrice))) : '', ''
+      ]] }
+    }));
+    console.log(`📋 Directory: new wholesaler — ${company || fromEmail}`);
+  }
 }
 
 // ── BRAIN UPDATE ──────────────────────────────────────────────────────────────
@@ -531,6 +641,7 @@ async function connectImap(retries = 3) {
 async function poll() {
   console.log(`\n[${new Date().toLocaleTimeString()}] Polling...`);
   await processCheckboxes();
+  await updateDaysActive();
   await archiveExpired();
 
   let client, written = 0, dupes = 0, priceChanges = 0, errors = 0;
@@ -593,6 +704,12 @@ async function poll() {
                   requestBody: { values: [buildRow(p, c.subj, c.uid, propType)] }
                 }));
                 console.log(`  ✅ [${propType}] ${p.address}, ${p.city} | Ask:$${p.asking_price} ARV:$${p.arv}`);
+                // Update wholesaler directory
+                await updateWholesalerDirectory(
+                  c.from, v(p.wholesaler_company), v(p.contact_1_name),
+                  v(p.contact_1_phone), v(p.contact_1_website),
+                  propType, v(p.asking_price)
+                );
                 written++;
               }
               await new Promise(r => setTimeout(r, 300));
