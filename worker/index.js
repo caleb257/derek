@@ -769,6 +769,59 @@ async function poll() {
   }
 }
 
+// ── BACKFILL WHOLESALER DIRECTORY FROM BRAIN ─────────────────────────────────
+async function backfillWholesalerDirectory() {
+  const s = getSheets();
+
+  // Check if directory already has data — only backfill if empty
+  const dirCheck = await sc(() => s.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID, range: 'Wholesaler Directory!A2:A2'
+  })).catch(() => null);
+  if (dirCheck?.data?.values?.length) {
+    console.log('📋 Wholesaler Directory already has data — skipping backfill');
+    return;
+  }
+
+  // Pull Derek's Brain
+  const brain = await sc(() => s.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID, range: "Derek's Brain!A:J"
+  })).catch(() => null);
+  const rows = brain?.data?.values || [];
+  if (rows.length <= 1) { console.log('📋 Brain empty — nothing to backfill'); return; }
+
+  const today = new Date().toISOString().split('T')[0];
+  const entries = [];
+
+  for (let i = 1; i < rows.length; i++) {
+    const email = rows[i][0] || '';
+    const company = rows[i][1] || '';
+    const timesSent = rows[i][3] || '0';
+    const avgProps = rows[i][8] || '1.0';
+    if (!email) continue;
+    entries.push([
+      company,   // Company
+      '',        // Contact Name — not in Brain, will fill from future deals
+      email,     // Email
+      '',        // Phone — not in Brain
+      '',        // Website — not in Brain
+      timesSent, // Deals Sent
+      avgProps,  // Avg Properties/Email
+      today,     // Last Deal Date
+      '',        // Property Types
+      '',        // Avg Asking Price
+      ''         // Notes
+    ]);
+  }
+
+  if (!entries.length) return;
+
+  await sc(() => s.spreadsheets.values.append({
+    spreadsheetId: SHEET_ID, range: 'Wholesaler Directory!A:A',
+    valueInputOption: 'RAW', requestBody: { values: entries }
+  }));
+  console.log(`📋 Backfilled ${entries.length} wholesalers into Directory from Brain`);
+}
+
 // ── BOOT ──────────────────────────────────────────────────────────────────────
 const POLL_MS = parseInt(process.env.POLL_INTERVAL || '300000');
 console.log(`🤙 Derek | ${process.env.IMAP_USER} | every ${POLL_MS/60000}min`);
@@ -776,5 +829,6 @@ console.log(`COL map: Address=${COL['Address']} AskingPrice=${COL['Asking Price'
 
 initSheet()
   .then(() => loadSeenFromSheet())
+  .then(() => backfillWholesalerDirectory())
   .then(() => { poll(); setInterval(poll, POLL_MS); })
   .catch(e => { console.error('Init error:', e.message); poll(); setInterval(poll, POLL_MS); });
