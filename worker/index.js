@@ -73,7 +73,7 @@ async function flushSeen() {
 
 // ── SCHEMA ────────────────────────────────────────────────────────────────────
 const ACTIVE_HEADERS = [
-  'Date Received', 'Pass', 'Sold', 'Review', 'Expires', 'Property Type',
+  'Date Received', 'Pass', 'Sold', 'Review', 'Asking Price', 'ARV', 'Expires', 'Property Type',
   'Address', 'City', 'State', 'Zip', 'County', 'Subdivision',
   'Beds', 'Baths', 'Half Baths', 'Sqft', 'Lot Sqft', 'Lot Acres',
   'Year Built', 'Stories', 'Construction', 'Foundation',
@@ -81,7 +81,7 @@ const ACTIVE_HEADERS = [
   'Overall Condition', 'Roof Type', 'Roof Age / Year', 'AC Year / Age',
   'Water Heater', 'Electrical', 'Plumbing', 'Windows', 'Flooring',
   'Kitchen Notes', 'Bath Notes',
-  'Asking Price', 'ARV', 'Repairs Estimate', 'Assignment Fee', 'Equity',
+  'Repairs Estimate', 'Assignment Fee', 'Equity',
   'Rent Current', 'Rent Market', 'Annual Taxes', 'HOA Fee',
   'Close Date', 'Inspection Period', 'Earnest Money', 'Financing Terms', 'Cash Only',
   'Contact 1 Name', 'Contact 1 Title', 'Contact 1 Company',
@@ -282,7 +282,7 @@ function buildRow(p, subject, uid, propType) {
   const now = new Date();
   const expires = new Date(now.getTime() + 7*24*60*60*1000);
   return [
-    now.toISOString(), false, false, false, expires.toISOString(), propType,
+    now.toISOString(), false, false, false, v(p.asking_price), v(p.arv), expires.toISOString(), propType,
     v(p.address), v(p.city), v(p.state), v(p.zip), v(p.county), v(p.subdivision),
     v(p.beds), v(p.baths), v(p.half_baths), v(p.sqft), v(p.lot_sqft), v(p.lot_acres),
     v(p.year_built), v(p.stories), v(p.construction), v(p.foundation),
@@ -291,7 +291,7 @@ function buildRow(p, subject, uid, propType) {
     v(p.overall_condition), v(p.roof_type), v(p.roof_age), v(p.ac_year),
     v(p.water_heater), v(p.electrical), v(p.plumbing), v(p.windows), v(p.flooring),
     v(p.kitchen_notes), v(p.bath_notes),
-    v(p.asking_price), v(p.arv), v(p.repairs_estimate), v(p.assignment_fee), v(p.equity),
+    v(p.repairs_estimate), v(p.assignment_fee), v(p.equity),
     v(p.rent_current), v(p.rent_market), v(p.annual_taxes), v(p.hoa_fee),
     v(p.close_date), v(p.inspection_period), v(p.earnest_money),
     v(p.financing_terms), v(p.cash_only),
