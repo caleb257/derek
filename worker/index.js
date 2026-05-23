@@ -7,14 +7,43 @@ const fs = require('fs');
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const SHEET_ID = process.env.GOOGLE_SHEET_ID;
-const SEEN_FILE = '/tmp/seen.json';
-
 process.on('uncaughtException', e => console.error('ERR:', e.message));
 process.on('unhandledRejection', e => console.error('REJ:', e?.message || e));
 
+// Seen IDs stored in Google Sheets (persistent across Railway restarts/container moves)
+// Falls back to in-memory if sheet not ready yet
 let seen = new Set();
-try { seen = new Set(JSON.parse(fs.readFileSync(SEEN_FILE))); } catch {}
-const saveSeen = () => { try { fs.writeFileSync(SEEN_FILE, JSON.stringify([...seen])); } catch {} };
+let seenSheetReady = false;
+
+async function loadSeenFromSheet() {
+  try {
+    const s = getSheets();
+    const res = await s.spreadsheets.values.get({
+      spreadsheetId: SHEET_ID, range: 'Seen!A:A'
+    }).catch(() => null);
+    const rows = res?.data?.values || [];
+    seen = new Set(rows.slice(1).map(r => r[0]).filter(Boolean));
+    seenSheetReady = true;
+    console.log(`📂 Loaded ${seen.size} seen IDs from sheet`);
+  } catch (e) {
+    console.error('Could not load seen IDs from sheet:', e.message);
+  }
+}
+
+async function saveSeen() {
+  if (!seenSheetReady) return;
+  try {
+    const s = getSheets();
+    const values = [['Email UID'], ...[...seen].map(uid => [uid])];
+    await s.spreadsheets.values.clear({ spreadsheetId: SHEET_ID, range: 'Seen!A:A' });
+    await s.spreadsheets.values.update({
+      spreadsheetId: SHEET_ID, range: 'Seen!A1',
+      valueInputOption: 'RAW', requestBody: { values }
+    });
+  } catch (e) {
+    console.error('Could not save seen IDs to sheet:', e.message);
+  }
+}
 
 function getSheets() {
   const creds = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
@@ -291,10 +320,10 @@ async function initSheet() {
       spreadsheetId: SHEET_ID, range: 'Active Deals!A1',
       valueInputOption: 'RAW', requestBody: { values: [ACTIVE_HEADERS] }
     });
-    seen = new Set(); saveSeen();
+    seen = new Set(); await saveSeen();
     console.log(`Sheet initialized: ${ACTIVE_HEADERS.length} columns`);
   } else if (!hasData) {
-    seen = new Set(); saveSeen();
+    seen = new Set(); await saveSeen();
     console.log('Sheet empty — resetting seen IDs');
   } else {
     console.log('Sheet has data — resuming');
@@ -321,6 +350,18 @@ async function initSheet() {
       valueInputOption: 'RAW', requestBody: { values: [['Date', 'From', 'Subject', 'UID', 'Error']] }
     });
     console.log('Errors tab initialized');
+  }
+
+  // Seen UIDs tab (persistent across restarts)
+  const seenCheck = await s.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID, range: 'Seen!A1:A1'
+  }).catch(() => null);
+  if (!seenCheck?.data?.values?.[0]?.[0]) {
+    await s.spreadsheets.values.update({
+      spreadsheetId: SHEET_ID, range: 'Seen!A1',
+      valueInputOption: 'RAW', requestBody: { values: [['Email UID']] }
+    });
+    console.log('Seen tab initialized');
   }
 
   // Derek's Brain tab
@@ -405,7 +446,8 @@ async function updateBrain(fromEmail, company, subject, propertyCount, body) {
   if (existingRow > 0) {
     const existing = rows[existingRow - 1];
     const timesSent = parseInt(existing[3] || '0') + 1;
-    const prevAvg = parseFloat(existing[8] || '0');
+    const prevAvgRaw = parseFloat(existing[8] || '0');
+    const prevAvg = isNaN(prevAvgRaw) ? 0 : prevAvgRaw;
     const avgProps = ((prevAvg * (timesSent - 1)) + propertyCount) / timesSent;
 
     await s.spreadsheets.values.update({
@@ -472,7 +514,7 @@ async function poll() {
         if (isDealEmail(subj, from)) candidates.push({ uid, subj, from });
         else seen.add(uid);
       }
-      saveSeen();
+      await saveSeen();
       console.log(`${candidates.length} deal email(s) to process`);
 
       // Phase 2: full body + extract
@@ -511,13 +553,13 @@ async function poll() {
           }
 
           seen.add(c.uid);
-          saveSeen();
+          await saveSeen();
           await new Promise(r => setTimeout(r, 500));
         } catch (e) {
           console.error(`  Error on UID ${c.uid}:`, e.message);
           await logError(c.from, c.subj, c.uid, e.message);
           seen.add(c.uid);
-          saveSeen();
+          await saveSeen();
           errors++;
         }
       }
@@ -537,11 +579,13 @@ console.log(`🤙 Derek | ${process.env.IMAP_USER} | every ${POLL_MS / 60000}min
 console.log(`✓ Extended keywords | ✓ Better dupe detection | ✓ Error logging`);
 console.log(`✓ 7-day lookback | ✓ Footer stripping | ✓ Brain-informed extraction`);
 
-initSheet().then(() => {
-  poll();
-  setInterval(poll, POLL_MS);
-}).catch(e => {
-  console.error('Init error:', e.message);
-  poll();
-  setInterval(poll, POLL_MS);
-});
+initSheet()
+  .then(() => loadSeenFromSheet())
+  .then(() => {
+    poll();
+    setInterval(poll, POLL_MS);
+  }).catch(e => {
+    console.error('Init error:', e.message);
+    poll();
+    setInterval(poll, POLL_MS);
+  });
