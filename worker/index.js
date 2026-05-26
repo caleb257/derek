@@ -47,6 +47,20 @@ function colLetter(idx) {
 }
 
 // Seen persistence — loads once at boot, saves once at end of each poll
+// Known wholesaler emails from Brain — bypass keyword filter for these
+let knownSenders = new Set();
+
+async function loadKnownSenders() {
+  try {
+    const res = await sc(() => getSheets().spreadsheets.values.get({
+      spreadsheetId: SHEET_ID, range: "Derek's Brain!A:A"
+    }));
+    const rows = res?.data?.values || [];
+    knownSenders = new Set(rows.slice(1).map(r => r[0]).filter(Boolean));
+    console.log(`📧 Loaded ${knownSenders.size} known senders from Brain`);
+  } catch (e) { console.error('loadKnownSenders error:', e.message); }
+}
+
 async function loadSeenFromSheet() {
   try {
     const res = await sc(() => getSheets().spreadsheets.values.get({
@@ -136,6 +150,8 @@ const DEAL_WORDS = [
   'commercial','land','lot for sale','tear down','teardown'
 ];
 const isDealEmail = (subj, from) => {
+  // Always process emails from known wholesalers regardless of subject
+  if (knownSenders.has(from)) return true;
   const t = `${subj} ${from}`.toLowerCase();
   return DEAL_WORDS.some(k => t.includes(k));
 };
@@ -235,7 +251,10 @@ async function extractProperties(from, subject, body) {
   const res = await anthropic.messages.create({
     model: 'claude-haiku-4-5-20251001', max_tokens: 4000,
     messages: [{ role: 'user', content: `You are a real estate data extraction engine for Coralstone Capital Group.
-Extract EVERY property from this wholesale deal email as a JSON array — one object per property.${hint}
+Extract EVERY property from this wholesale deal email as a JSON array — one object per property.
+If this is a forwarded email (contains "Fwd:" or "---------- Forwarded message"), extract from the forwarded content.
+If no specific properties are mentioned but a URL or link is present, still extract whatever data is available.
+If there are no extractable properties at all, return an empty array [].${hint}
 
 Fields per object (null if missing):
 address, city, state, zip, county, subdivision,
@@ -612,6 +631,7 @@ async function updateBrain(fromEmail, company, subject, propCount, body) {
       requestBody: { values: [[fromEmail, company||'', now, 1, fmt, 'address,beds,baths,sqft,asking,arv,drive link,phone', 'Check Google Drive links per property', '', propCount.toString(), `First: ${subject}`]] }
     }));
     console.log(`🧠 New wholesaler: ${fromEmail}`);
+    knownSenders.add(fromEmail); // add to in-memory set immediately
   }
 }
 
@@ -785,6 +805,7 @@ console.log(`Days Active col: ${colLetter(COL['Days Active'])} | Address col: ${
 
 initSheet()
   .then(() => loadSeenFromSheet())
+  .then(() => loadKnownSenders())
   .then(() => backfillWholesalerDirectory())
   .then(() => { poll(); setInterval(poll, POLL_MS); })
   .catch(e => { console.error('Init error:', e.message); poll(); setInterval(poll, POLL_MS); });
