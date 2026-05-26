@@ -149,11 +149,56 @@ const DEAL_WORDS = [
   'manufactured','mobile home','duplex','triplex','fourplex','multi-family',
   'commercial','land','lot for sale','tear down','teardown'
 ];
+// Real estate company domain patterns — any email from these gets through
+const DEAL_DOMAINS = [
+  'properties', 'homes', 'realty', 'realtors', 'investments', 'capital',
+  'acquisitions', 'buyers', 'sellers', 'wholesal', 'flipper', 'investor',
+  'estate', 'housing', 'proptech', 'homesolutions', 'cashbuyer', 'offmarket',
+  '27.pro', 'prophethomes', 'mitchelldean', 'keygleehomes', 'alpinetrustproperties',
+  'automation.podio', '21propertygroup', 'sell4no', 'flbuyers', 'coralstone'
+];
+
+// Broad subject keywords — much wider net than before
+const DEAL_WORDS_EXTRA = [
+  'property', 'properties', 'home', 'house', 'deal', 'flip', 'rehab', 'invest',
+  'wholesale', 'off market', 'off-market', 'listing', 'available', 'sale',
+  'buyer', 'seller', 'motivated', 'equity', 'arv', 'asking', 'price',
+  '3/2', '4/2', '4/3', '2/2', '3/1', '5/3', '5/4', '4/4', '3/3', '2/1',
+  'sqft', 'sq ft', 'beds', 'bath', 'bedroom', 'single family', 'sfr',
+  'foreclosure', 'probate', 'vacant', 'estate', 'cash', 'assignment',
+  'subject to', 'sub to', 'seller financ', 'opportunity', 'acquisition',
+  'portfolio', 'distressed', 'reduced', 'new deal', 'hot deal', 'just listed',
+  'multi', 'duplex', 'triplex', 'commercial', 'land', 'lot', 'acre',
+  'manufactured', 'mobile', 'condo', 'townhome', 'investment', 'rental',
+  'bungalow', 'fixer', 'as-is', 'as is', 'tear down', 'teardown',
+  'below market', 'must sell', 'check this out', 'check out', 'new listing',
+  'just came in', 'just hit', 'fresh deal', 'pocket listing', 'new one',
+  'new property', 'new properties', 'have a deal', 'got a deal', 'good deal',
+  'great deal', 'price drop', 'price reduction', 'reduced price', 'price cut',
+  'back on market', 'back on the market', 'back on', 'price change', 'updated',
+  'contract', 'under contract', 'close', 'closing', 'escrow', 'title',
+  'inspect', 'walk', 'drive by', 'showing', 'view', 'visit', 'tour',
+  'tampa', 'st pete', 'saint pete', 'clearwater', 'brandon', 'lakeland',
+  'orlando', 'miami', 'jacksonville', 'sarasota', 'naples', 'fort myers',
+  'spring hill', 'brooksville', 'zephyrhills', 'holiday', 'new port richey',
+  'port richey', 'hudson', 'hernando', 'pasco', 'hillsborough', 'pinellas',
+  'manatee', 'polk', 'florida', ' fl ', ',fl', 'fl 3'
+];
+
 const isDealEmail = (subj, from) => {
-  // Always process emails from known wholesalers regardless of subject
+  // 1. Always process known senders regardless of subject
   if (knownSenders.has(from)) return true;
+
+  // 2. Domain pattern matching — real estate company domains
+  const fromLower = from.toLowerCase();
+  if (DEAL_DOMAINS.some(d => fromLower.includes(d))) return true;
+
+  // 3. Broad keyword matching on subject + from
   const t = `${subj} ${from}`.toLowerCase();
-  return DEAL_WORDS.some(k => t.includes(k));
+  if (DEAL_WORDS.some(k => t.includes(k))) return true;
+  if (DEAL_WORDS_EXTRA.some(k => t.includes(k))) return true;
+
+  return false;
 };
 
 // ── PROPERTY TYPE ─────────────────────────────────────────────────────────────
@@ -237,6 +282,24 @@ async function getBrainContext(fromEmail) {
     }
   }
   return null;
+}
+
+// ── LIGHTWEIGHT DEAL PRE-SCREEN (only for unknown senders) ───────────────────
+async function isActuallyADeal(from, subject, body) {
+  // Only pre-screen unknown senders with short ambiguous subjects
+  // Known senders and clear keyword matches skip this
+  const preview = body.slice(0, 1500);
+  const res = await anthropic.messages.create({
+    model: 'claude-haiku-4-5-20251001', max_tokens: 10,
+    messages: [{ role: 'user', content: `Does this email contain a real estate property for sale (wholesale deal, investment property, fix and flip, etc)? Reply only YES or NO.
+
+From: ${from}
+Subject: ${subject}
+Body preview: ${preview}` }]
+  }).catch(() => null);
+  if (!res) return true; // if check fails, assume it's a deal
+  const answer = res.content[0].text.trim().toUpperCase();
+  return answer.startsWith('Y');
 }
 
 // ── EXTRACTION ────────────────────────────────────────────────────────────────
@@ -739,6 +802,21 @@ async function poll() {
           const msgData = await client.fetchOne(c.uid, { source: true }, { uid: true });
           const parsed = await simpleParser(msgData.source);
           const rawBody = parsed.text || (parsed.html||'').replace(/<[^>]*>/g,' ').replace(/\s+/g,' ');
+
+          // Pre-screen unknown senders to filter out newsletters/spam
+          // Known senders and strong keyword matches skip this entirely
+          const isKnown = knownSenders.has(c.from);
+          const hasStrongKeyword = DEAL_WORDS.some(k => `${c.subj} ${c.from}`.toLowerCase().includes(k));
+          if (!isKnown && !hasStrongKeyword) {
+            const isDeal = await isActuallyADeal(c.from, c.subj, rawBody);
+            if (!isDeal) {
+              console.log(`  ⏩ Not a deal (pre-screen) — skipping`);
+              seen.add(c.uid); seenDirty = true;
+              await new Promise(r => setTimeout(r, 200));
+              continue;
+            }
+          }
+
           const properties = await extractProperties(c.from, c.subj, rawBody);
 
           if (!properties || properties.length === 0) {
