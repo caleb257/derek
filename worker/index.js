@@ -187,17 +187,20 @@ const DEAL_WORDS_EXTRA = [
 
 const isDealEmail = (subj, from) => {
   // 1. Always process known senders regardless of subject
-  if (knownSenders.has(from)) return true;
+  if (knownSenders.has(from)) { return true; }
 
   // 2. Domain pattern matching — real estate company domains
   const fromLower = from.toLowerCase();
-  if (DEAL_DOMAINS.some(d => fromLower.includes(d))) return true;
+  const matchedDomain = DEAL_DOMAINS.find(d => fromLower.includes(d));
+  if (matchedDomain) { return true; }
 
   // 3. Broad keyword matching on subject + from
   const t = `${subj} ${from}`.toLowerCase();
-  if (DEAL_WORDS.some(k => t.includes(k))) return true;
-  if (DEAL_WORDS_EXTRA.some(k => t.includes(k))) return true;
+  const matchedWord = DEAL_WORDS.find(k => t.includes(k)) || DEAL_WORDS_EXTRA.find(k => t.includes(k));
+  if (matchedWord) { return true; }
 
+  // Nothing matched — log it so we can see what's being filtered
+  console.log(`  🔍 Filter miss: "${subj}" from ${from} — sending to Haiku pre-screen`);
   return false;
 };
 
@@ -783,17 +786,17 @@ async function poll() {
     try {
       const since = new Date(Date.now() - 7*24*60*60*1000);
 
-      // Phase 1: envelopes only — zero API cost
+      // Phase 1: envelopes only — queue ALL new unseen emails for phase 2 screening
+      // We never filter at envelope level for unknown senders — Haiku screens them in phase 2
       const candidates = [];
       for await (const msg of client.fetch({ since }, { envelope: true, uid: true })) {
         const uid = String(msg.uid);
         if (seen.has(uid)) continue;
         const subj = msg.envelope?.subject || '';
         const from = msg.envelope?.from?.[0]?.address || '';
-        if (isDealEmail(subj, from)) candidates.push({ uid, subj, from });
-        else { seen.add(uid); seenDirty = true; }
+        candidates.push({ uid, subj, from });
       }
-      console.log(`${candidates.length} deal email(s) to process`);
+      console.log(`${candidates.length} new email(s) to screen`);
 
       // Phase 2: full body + extract
       for (const c of candidates) {
@@ -803,18 +806,21 @@ async function poll() {
           const parsed = await simpleParser(msgData.source);
           const rawBody = parsed.text || (parsed.html||'').replace(/<[^>]*>/g,' ').replace(/\s+/g,' ');
 
-          // Pre-screen unknown senders to filter out newsletters/spam
-          // Known senders and strong keyword matches skip this entirely
-          const isKnown = knownSenders.has(c.from);
-          const hasStrongKeyword = DEAL_WORDS.some(k => `${c.subj} ${c.from}`.toLowerCase().includes(k));
-          if (!isKnown && !hasStrongKeyword) {
+          // Smart screening: known senders + strong keywords → skip Haiku entirely
+          // Everyone else gets a fast Haiku YES/NO check (~$0.0001 each)
+          const fastPass = isDealEmail(c.subj, c.from);
+          if (!fastPass) {
+            console.log(`  🤖 Haiku screening: "${c.subj}" from ${c.from}`);
             const isDeal = await isActuallyADeal(c.from, c.subj, rawBody);
             if (!isDeal) {
-              console.log(`  ⏩ Not a deal (pre-screen) — skipping`);
+              console.log(`  ⏩ Not a deal — skipping`);
               seen.add(c.uid); seenDirty = true;
               await new Promise(r => setTimeout(r, 200));
               continue;
             }
+            console.log(`  ✅ Haiku confirmed deal — extracting`);
+          } else {
+            console.log(`  ✅ Fast pass — extracting`);
           }
 
           const properties = await extractProperties(c.from, c.subj, rawBody);
