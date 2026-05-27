@@ -843,16 +843,26 @@ async function poll() {
           const htmlBody = parsed.html || '';
           let rawBody = parsed.text || '';
 
-          // If text body is thin, extract text from HTML (alt text, link text, visible text nodes)
-          if (rawBody.trim().length < 200 && htmlBody) {
-            rawBody = htmlBody
-              .replace(/<style[^>]*>.*?<\/style>/gis, '')   // strip style blocks
-              .replace(/<script[^>]*>.*?<\/script>/gis, '')  // strip scripts
-              .replace(/<img[^>]+alt="([^"]+)"/gi, ' $1 ')   // extract alt text
-              .replace(/<a[^>]+href="([^"]+)"[^>]*>([^<]*)<\/a>/gi, ' $2 ($1) ') // link text + href
-              .replace(/<[^>]+>/g, ' ')                       // strip remaining tags
+          // Always try to extract text from HTML — even if text body exists
+          // Image-heavy emails often have critical data only in HTML attributes/links
+          if (htmlBody && rawBody.trim().length < 5000) {
+            const htmlText = htmlBody
+              .replace(/<style[^>]*>.*?<\/style>/gis, '')
+              .replace(/<script[^>]*>.*?<\/script>/gis, '')
+              .replace(/<img[^>]+alt="([^"]+)"/gi, ' [IMG: $1] ')
+              .replace(/<td[^>]*>/gi, ' ')
+              .replace(/<tr[^>]*>/gi, '\n')
+              .replace(/<br\s*\/?>/gi, '\n')
+              .replace(/<p[^>]*>/gi, '\n')
+              .replace(/<div[^>]*>/gi, '\n')
+              .replace(/<a[^>]+href="(https?[^"]+)"[^>]*>([^<]*)<\/a>/gi, ' $2 (link: $1) ')
+              .replace(/<[^>]+>/g, ' ')
               .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-              .replace(/\s+/g, ' ').trim();
+              .replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+            if (htmlText.length > rawBody.trim().length) {
+              rawBody = htmlText;
+              if (rawBody.length > 200) console.log(`  📄 Using HTML text (${rawBody.length} chars)`);
+            }
           }
 
           // Extract image URLs from HTML for Vision processing
@@ -924,7 +934,16 @@ async function poll() {
             console.log(`  ✅ Fast pass — extracting`);
           }
 
-          const properties = await extractProperties(c.from, c.subj, rawBody);
+          let properties = await extractProperties(c.from, c.subj, rawBody);
+
+          // Fallback: if extraction fails, try with ONLY the subject line + sender
+          // This catches cases where body parsing fails but subject has key info
+          if (!properties || properties.length === 0) {
+            console.log('  → Extraction failed — trying subject-only fallback');
+            properties = await extractProperties(c.from, c.subj,
+              `Subject: ${c.subj}\nFrom: ${c.from}\nNote: Email body could not be parsed. Extract what you can from subject line only.`
+            );
+          }
 
           if (!properties || properties.length === 0) {
             console.log('  → No properties extracted');
