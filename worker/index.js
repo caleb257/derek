@@ -16,6 +16,9 @@ process.on('unhandledRejection', e => console.error('REJ:', e?.message || e));
 let seen = new Set();
 let seenSheetReady = false;
 let seenDirty = false; // track if seen changed this poll
+// Wholesaler combo dedup: "email|city|zip" -> asking price, prevent re-logging same deal
+const recentWholesalerDeals = new Map(); // combo -> { price, ts }
+const WHOLESALER_COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 function getSheets() {
   const creds = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
@@ -166,6 +169,9 @@ const BLOCKED_DOMAINS = [
   'homelight.com', 'opendoor.com', 'offerpad.com', 'realpage.com',
 ];
 
+// Podio CRM emails — structured deal data, always process
+const PODIO_DOMAINS = ['automation.podio.com', 'podio.com'];
+
 const DEAL_DOMAINS = [
   'properties', 'homes', 'realty', 'realtors', 'investments', 'capital',
   'acquisitions', 'buyers', 'sellers', 'wholesal', 'flipper', 'investor',
@@ -205,10 +211,13 @@ const DEAL_WORDS_EXTRA = [
 const isDealEmail = (subj, from) => {
   const fromLower = from.toLowerCase();
 
-  // 0. Block market report / portal senders — these are NOT wholesale deals
+  // 0a. Block market report / portal senders — these are NOT wholesale deals
   if (BLOCKED_DOMAINS.some(d => fromLower.includes(d))) {
     return false; // silently skip — not a deal
   }
+
+  // 0b. Podio CRM emails always contain real deal data — fast pass
+  if (PODIO_DOMAINS.some(d => fromLower.includes(d))) { return true; }
 
   // 1. Always process known senders regardless of subject
   if (knownSenders.has(from)) { return true; }
@@ -359,6 +368,11 @@ async function extractProperties(from, subject, body) {
   let hint = '';
   if (brain?.timesSent > 0) {
     hint = `\n\nKNOWN SENDER (${brain.timesSent} prior emails): format=${brain.formatType}. ${brain.whatWorks}. Watch: ${brain.watchOutFor}.`;
+  }
+  // Podio CRM hint — these emails have a specific field layout
+  const isPodio = from.toLowerCase().includes('podio');
+  if (isPodio) {
+    hint += `\n\nPODIO CRM EMAIL: Fields appear as "Label: Value" pairs. Address is usually on its own line. Look for: Address, City, State, Zip, Beds, Baths, Sqft, Asking Price, ARV, Repairs, Contact, Phone.`;
   }
 
   const res = await anthropic.messages.create({
@@ -993,6 +1007,25 @@ async function poll() {
 
               const propType = detectPropertyType(p);
               const dupeAddr = isRedacted ? `XXXX-${p.city}-${p.zip}` : p.address;
+
+              // Wholesaler combo cooldown: same wholesaler + city + zip within 7 days
+              // (catches repeat blasts of the same XXXX deal before it hits the sheet)
+              if (isRedacted) {
+                const comboKey = `${c.from}|${(p.city||'').toLowerCase()}|${p.zip}`;
+                const recent = recentWholesalerDeals.get(comboKey);
+                const now = Date.now();
+                if (recent && (now - recent.ts) < WHOLESALER_COOLDOWN_MS) {
+                  const priceChanged = p.asking_price && recent.price &&
+                    Math.abs(safeNum(p.asking_price) - safeNum(recent.price)) > 1000;
+                  if (!priceChanged) {
+                    console.log(`  🔁 Cooldown: same XXXX deal from ${c.from} in ${p.city} (sent ${Math.round((now-recent.ts)/3600000)}h ago)`);
+                    dupes++;
+                    continue;
+                  }
+                }
+                recentWholesalerDeals.set(comboKey, { price: p.asking_price, ts: now });
+              }
+
               const dupe = await checkDuplicate(dupeAddr, p.city, p.zip, p.asking_price);
 
               if (dupe.isDupe && dupe.isPriceChange) {
@@ -1020,9 +1053,12 @@ async function poll() {
                 written++;
                 // Auto-underwrite via Urban (non-blocking)
                 // Use address as the lookup key — Urban matches deals by address
-                triggerUrbanUnderwrite(
-                  v(p.address), v(p.city), v(p.state), v(p.zip), v(p.address)
-                ).catch(e => console.log(`  Urban trigger err: ${e.message}`));
+                // Only trigger Urban for non-XXXX addresses (can't underwrite without address)
+                if (p.address && p.address !== 'XXXX') {
+                  triggerUrbanUnderwrite(
+                    v(p.address), v(p.city), v(p.state), v(p.zip)
+                  ).catch(e => console.log(`  Urban trigger err: ${e.message}`));
+                }
               }
               await new Promise(r => setTimeout(r, 300));
             }
@@ -1061,14 +1097,11 @@ async function poll() {
 }
 
 // ── TRIGGER URBAN AUTO-UNDERWRITE ────────────────────────────────────────────
-async function triggerUrbanUnderwrite(address, city, state, zip, uid) {
+async function triggerUrbanUnderwrite(address, city, state, zip) {
   try {
     console.log(`  🏙️ Triggering Urban auto-underwrite for ${address}...`);
-    // Hit Urban's underwrite endpoint — fire and forget (don't await full response)
-    // Urban uses SSE streaming so we just open the connection and let it run
-    // Encode the address as the uid — Urban will match by address
-    const encUid = encodeURIComponent(uid);
-    const res = await fetch(`${URBAN_URL}/api/underwrite-by-address/${encUid}`, {
+    const encAddr = encodeURIComponent(address);
+    const res = await fetch(`${URBAN_URL}/api/underwrite-by-address/${encAddr}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
