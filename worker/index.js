@@ -1073,7 +1073,12 @@ console.log(`Days Active col: ${colLetter(COL['Days Active'])} | Address col: ${
 
 initSheet()
   .then(() => loadSeenFromSheet())
-  .then(() => loadKnownSenders())
+  .then(() => {
+    // Clear the most recent UIDs so failed extractions get retried
+    // Dupe detection prevents re-writing already-saved deals
+    clearRecentFromSeen(150); // clear top 150 most recent UIDs
+    return loadKnownSenders();
+  })
   .then(() => backfillWholesalerDirectory())
   .then(() => { poll(); setInterval(poll, POLL_MS); })
   .catch(e => { console.error('Init error:', e.message); poll(); setInterval(poll, POLL_MS); });
