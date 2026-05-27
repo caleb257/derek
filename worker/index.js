@@ -1189,60 +1189,10 @@ function clearRecentFromSeen(count = 50) {
 // ── BOOT ──────────────────────────────────────────────────────────────────────
 const POLL_MS = parseInt(process.env.POLL_INTERVAL || '300000');
 
-// ── DEREK AGENT API (minimal HTTP for Adam to query) ──────────────────────────
-const http = require('http');
-const DEREK_PORT = parseInt(process.env.DEREK_PORT || '3002');
-const DEREK_TOKEN = process.env.DEREK_TOKEN || 'coralstone2025';
-
-const derekServer = http.createServer(async (req, res) => {
-  const auth = req.headers['x-agent-token'] || req.headers['x-derek-token'];
-  if (auth !== DEREK_TOKEN) {
-    res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
-  }
-  if (req.method !== 'POST') {
-    res.writeHead(405); res.end(); return;
-  }
-  let body = '';
-  req.on('data', d => body += d);
-  req.on('end', async () => {
-    try {
-      const { question, dealAddress } = JSON.parse(body || '{}');
-      console.log(`🤝 Agent query from Adam: ${question}`);
-
-      // Answer from sheet data
-      const Anthropic = require('@anthropic-ai/sdk');
-      const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-
-      // Get relevant context from Brain
-      const brainContext = [...knownSenders].slice(0, 10).join(', ');
-      const r = await client.messages.create({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 200,
-        messages: [{
-          role: 'user',
-          content: `You are Derek, a real estate deal harvesting agent for Coralstone Capital Group.
-Answer this question from Adam (acquisitions) based on your knowledge.
-Known active senders: ${brainContext}
-Question about deal "${dealAddress || 'unknown'}": ${question}
-Answer in 1-2 sentences. If you don't know, say so briefly.`
-        }]
-      });
-      const answer = r.content[0].text;
-      console.log(`🤝 Derek response: ${answer}`);
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ answer }));
-    } catch(e) {
-      res.writeHead(500); res.end(JSON.stringify({ error: e.message }));
-    }
-  });
-});
-
-// Also expose health check
-derekServer.on('request', (req, res) => {
-  if (req.url === '/health' && req.method === 'GET') {
-    res.writeHead(200); res.end(JSON.stringify({ status: 'Derek online', seen: seen.size }));
-  }
-});
+// ── DEREK AGENT NOTE ─────────────────────────────────────────────────────────
+// Derek is a background worker — no public HTTP. Adam queries deal history
+// directly from the Google Sheet via sheetLookup(). The DEREK_URL env var
+// is optional; if set, Adam will try to reach Derek there first.
 console.log(`🤙 Derek | ${process.env.IMAP_USER} | every ${POLL_MS/60000}min`);
 console.log(`Days Active col: ${colLetter(COL['Days Active'])} | Address col: ${colLetter(COL['Address'])} | Asking col: ${colLetter(COL['Asking Price'])}`);
 
@@ -1256,7 +1206,6 @@ initSheet()
   })
   .then(() => backfillWholesalerDirectory())
   .then(() => {
-    derekServer.listen(DEREK_PORT, () => console.log(`🔌 Derek agent API on port ${DEREK_PORT}`));
     poll();
     setInterval(poll, POLL_MS);
   })
