@@ -875,13 +875,16 @@ async function poll() {
                     timeout: 8000
                   });
                   if (!imgRes.ok) continue;
-                  const buf = await imgRes.buffer();
-                  const mime = imgRes.headers.get('content-type') || 'image/jpeg';
-                  // Only use if reasonable size (< 5MB)
-                  if (buf.length < 5 * 1024 * 1024) {
+                  const arrBuf = await imgRes.arrayBuffer();
+                  const buf = Buffer.from(arrBuf);
+                  const mime = (imgRes.headers.get('content-type') || 'image/jpeg').split(';')[0].trim();
+                  // Only use images (skip non-image content types)
+                  if (!mime.startsWith('image/')) continue;
+                  // Only use if reasonable size (< 4MB base64 limit)
+                  if (buf.length < 4 * 1024 * 1024) {
                     visionContent.push({
                       type: 'image',
-                      source: { type: 'base64', media_type: mime.split(';')[0], data: buf.toString('base64') }
+                      source: { type: 'base64', media_type: mime, data: buf.toString('base64') }
                     });
                   }
                 } catch(imgErr) { console.log(`  Image fetch failed: ${imgErr.message}`); }
@@ -1040,53 +1043,23 @@ async function triggerUrbanUnderwrite(address, city, state, zip, uid) {
 }
 
 // ── FORCE REPROCESS ──────────────────────────────────────────────────────────
-// Called on startup to clear any recent UIDs from seen that may have been
-// rejected but are actually valid deals worth re-extracting
-async function clearRecentFromSeen(daysBack = 3) {
+// Clears the top N highest UIDs from the seen set so Derek re-evaluates them
+// UIDs are IMAP sequential — highest = most recent
+// Safe: dupe detection prevents re-writing already-saved deals
+function clearRecentFromSeen(count = 50) {
   try {
-    // Get recent UIDs from IMAP that are in seen, check if they're in Active Deals
-    // If NOT in Active Deals, remove from seen so they get reprocessed
-    const client = await connectImap();
-    const lock = await client.getMailboxLock('INBOX');
-    const since = new Date(Date.now() - daysBack * 24 * 60 * 60 * 1000);
-    const recentUIDs = [];
-    try {
-      for await (const msg of client.fetch({ since }, { envelope: true, uid: true })) {
-        recentUIDs.push(String(msg.uid));
-      }
-    } finally { lock.release(); }
-    await client.logout();
-
-    // Get addresses already in Active Deals sheet
-    const res = await sc(() => getSheets().spreadsheets.values.get({
-      spreadsheetId: SHEET_ID, range: 'Active Deals!E:E' // Address column
-    }));
-    const existingAddresses = new Set((res?.data?.values || []).slice(1).map(r => (r[0]||'').toLowerCase().trim()));
-
-    // Get seen sheet to check which UIDs correspond to which emails
-    const seenRes = await sc(() => getSheets().spreadsheets.values.get({
-      spreadsheetId: SHEET_ID, range: 'Seen!A:B' // UID, optional address
-    }));
-
-    // For recent UIDs in seen: remove them so Derek reprocesses
-    // This handles cases where extraction failed or Haiku wrongly rejected
+    if (seen.size === 0) return;
+    // Sort all seen UIDs numerically, take the top `count`
+    const sorted = [...seen].map(Number).filter(n => !isNaN(n)).sort((a, b) => b - a);
+    const toRemove = sorted.slice(0, count);
     let removed = 0;
-    for (const uid of recentUIDs) {
-      if (seen.has(uid)) {
-        // We don't know if it was a deal or not-a-deal rejection
-        // Safely: remove it and let Haiku/extraction decide again
-        // Dupes will be caught by checkDuplicate
-        seen.delete(uid);
-        removed++;
-      }
+    for (const uid of toRemove) {
+      seen.delete(String(uid));
+      removed++;
     }
-
     if (removed > 0) {
       seenDirty = true;
-      await flushSeen();
-      console.log(`🔄 Cleared ${removed} recent UIDs from seen for reprocessing`);
-    } else {
-      console.log(`✅ No recent UIDs need reprocessing`);
+      console.log(`🔄 Cleared top ${removed} recent UIDs from seen — will reprocess`);
     }
   } catch(e) {
     console.log('clearRecentFromSeen error:', e.message);
