@@ -160,6 +160,12 @@ const DEAL_WORDS = [
   'commercial','land','lot for sale','tear down','teardown'
 ];
 // Real estate company domain patterns — any email from these gets through
+// These domains send market reports/alerts — NOT wholesale deals. Block entirely.
+const BLOCKED_DOMAINS = [
+  'realtor.com', 'zillow.com', 'trulia.com', 'redfin.com', 'homes.com',
+  'homelight.com', 'opendoor.com', 'offerpad.com', 'realpage.com',
+];
+
 const DEAL_DOMAINS = [
   'properties', 'homes', 'realty', 'realtors', 'investments', 'capital',
   'acquisitions', 'buyers', 'sellers', 'wholesal', 'flipper', 'investor',
@@ -197,11 +203,17 @@ const DEAL_WORDS_EXTRA = [
 ];
 
 const isDealEmail = (subj, from) => {
+  const fromLower = from.toLowerCase();
+
+  // 0. Block market report / portal senders — these are NOT wholesale deals
+  if (BLOCKED_DOMAINS.some(d => fromLower.includes(d))) {
+    return false; // silently skip — not a deal
+  }
+
   // 1. Always process known senders regardless of subject
   if (knownSenders.has(from)) { return true; }
 
   // 2. Domain pattern matching — real estate company domains
-  const fromLower = from.toLowerCase();
   const matchedDomain = DEAL_DOMAINS.find(d => fromLower.includes(d));
   if (matchedDomain) { return true; }
 
