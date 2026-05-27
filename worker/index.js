@@ -858,9 +858,9 @@ async function poll() {
                 console.log(`  ✅ [${propType}] ${p.address}, ${p.city} | Ask:$${p.asking_price} ARV:$${p.arv}`);
                 written++;
                 // Auto-underwrite via Urban (non-blocking)
-                const dealUID = c.uid || `${p.address}-${new Date().toISOString().split('T')[0]}`;
+                // Use address as the lookup key — Urban matches deals by address
                 triggerUrbanUnderwrite(
-                  v(p.address), v(p.city), v(p.state), v(p.zip), dealUID
+                  v(p.address), v(p.city), v(p.state), v(p.zip), v(p.address)
                 ).catch(e => console.log(`  Urban trigger err: ${e.message}`));
               }
               await new Promise(r => setTimeout(r, 300));
@@ -895,8 +895,9 @@ async function triggerUrbanUnderwrite(address, city, state, zip, uid) {
     console.log(`  🏙️ Triggering Urban auto-underwrite for ${address}...`);
     // Hit Urban's underwrite endpoint — fire and forget (don't await full response)
     // Urban uses SSE streaming so we just open the connection and let it run
+    // Encode the address as the uid — Urban will match by address
     const encUid = encodeURIComponent(uid);
-    const res = await fetch(`${URBAN_URL}/api/underwrite/${encUid}`, {
+    const res = await fetch(`${URBAN_URL}/api/underwrite-by-address/${encUid}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
