@@ -164,8 +164,9 @@ const DEAL_DOMAINS = [
   'properties', 'homes', 'realty', 'realtors', 'investments', 'capital',
   'acquisitions', 'buyers', 'sellers', 'wholesal', 'flipper', 'investor',
   'estate', 'housing', 'proptech', 'homesolutions', 'cashbuyer', 'offmarket',
-  '27.pro', 'prophethomes', 'mitchelldean', 'keygleehomes', 'alpinetrustproperties',
-  'automation.podio', '21propertygroup', 'sell4no', 'flbuyers', 'coralstone'
+  '27.pro', 'prophethomes', 'mitchelldean', 'investmdr', 'keygleehomes', 'alpinetrustproperties',
+  'automation.podio', '21propertygroup', 'sell4no', 'flbuyers', 'coralstone',
+  'hubs.ly', 'hubspotemail', 'sendgrid', 'mailchimp', 'constantcontact'
 ];
 
 // Broad subject keywords — much wider net than before
