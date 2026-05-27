@@ -973,8 +973,14 @@ async function poll() {
                 console.log(`  🔁 DUPE: ${p.address} (in ${dupe.tab})`);
                 dupes++;
               } else {
-                await sc(() => getSheets().spreadsheets.values.append({
-                  spreadsheetId: SHEET_ID, range: 'Active Deals!A:A',
+                // Find first empty row in col A (ignores checkbox-only rows)
+                const colARes = await sc(() => getSheets().spreadsheets.values.get({
+                  spreadsheetId: SHEET_ID, range: 'Active Deals!A:A'
+                }));
+                const colAVals = colARes?.data?.values || [];
+                const nextRow = colAVals.length + 1; // 1-indexed, after last filled A cell
+                await sc(() => getSheets().spreadsheets.values.update({
+                  spreadsheetId: SHEET_ID, range: `Active Deals!A${nextRow}`,
                   valueInputOption: 'RAW',
                   requestBody: { values: [buildRow(p, c.subj, c.uid, propType)] }
                 }));
