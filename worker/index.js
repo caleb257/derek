@@ -978,8 +978,18 @@ async function poll() {
           await new Promise(r => setTimeout(r, 500));
         } catch (e) {
           console.error(`  Error UID ${c.uid}:`, e.message);
-          await logError(c.from, c.subj, c.uid, e.message);
-          seen.add(c.uid); seenDirty = true;
+          // Don't mark seen on connection errors — retry next poll
+          const isConnErr = e.message?.includes('Connection not available') ||
+                            e.message?.includes('ECONNRESET') ||
+                            e.message?.includes('ETIMEDOUT') ||
+                            e.message?.includes('socket') ||
+                            e.message?.includes('network');
+          if (isConnErr) {
+            console.log(`  ↩️ Connection error — will retry UID ${c.uid} next poll`);
+          } else {
+            await logError(c.from, c.subj, c.uid, e.message);
+            seen.add(c.uid); seenDirty = true;
+          }
           errors++;
         }
       }
