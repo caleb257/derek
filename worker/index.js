@@ -844,9 +844,17 @@ async function poll() {
             await updateBrain(c.from, properties[0]?.wholesaler_company||'', c.subj, properties.length, rawBody);
 
             for (const p of properties) {
-              if (!p.address) { console.log('  → Skipped (no address)'); continue; }
+              // Accept redacted addresses (e.g. "XXXX, City FL") — wholesaler withholds until called
+              const isRedacted = !p.address || /^x+$/i.test((p.address || '').trim()) || (p.address || '').trim().length < 4;
+              if (isRedacted && !p.city) { console.log('  → Skipped (no address or city)'); continue; }
+              if (isRedacted) {
+                p.address = 'XXXX'; // redacted — call wholesaler
+                p.highlights = (p.highlights ? p.highlights + ' | ' : '') + 'ADDRESS REDACTED — CALL WHOLESALER FOR ADDRESS';
+                console.log(`  ⚠️ Redacted address — saving with XXXX placeholder for ${p.city}, ${p.state}`);
+              }
               const propType = detectPropertyType(p);
-              const dupe = await checkDuplicate(p.address, p.city, p.zip, p.asking_price);
+              const dupeAddr = isRedacted ? `XXXX-${p.city}-${p.zip}` : p.address;
+              const dupe = await checkDuplicate(dupeAddr, p.city, p.zip, p.asking_price);
 
               if (dupe.isDupe && dupe.isPriceChange) {
                 await logPriceChange(p, c.subj, dupe.oldPrice, dupe.newPrice);
