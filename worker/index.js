@@ -974,6 +974,23 @@ async function poll() {
                 p.highlights = (p.highlights ? p.highlights + ' | ' : '') + 'ADDRESS REDACTED — CALL WHOLESALER FOR ADDRESS';
                 console.log(`  ⚠️ Redacted address — saving with XXXX placeholder for ${p.city}, ${p.state}`);
               }
+              // Florida only — skip any property not in FL
+              const stateVal = (p.state || '').toUpperCase().trim();
+              if (stateVal && stateVal !== 'FL' && stateVal !== 'FLORIDA') {
+                console.log(`  ⏭️ Skipping non-FL property: ${p.address}, ${p.city}, ${p.state}`);
+                continue;
+              }
+              // If state is blank, check city for common out-of-state giveaways
+              // (Beverly Hills, etc.) — skip if zip starts with non-FL prefix
+              if (!stateVal && p.zip) {
+                const zipNum = parseInt(p.zip);
+                // Florida zips: 32004-34997
+                if (!isNaN(zipNum) && (zipNum < 32004 || zipNum > 34997)) {
+                  console.log(`  ⏭️ Skipping non-FL zip: ${p.address}, ${p.zip}`);
+                  continue;
+                }
+              }
+
               const propType = detectPropertyType(p);
               const dupeAddr = isRedacted ? `XXXX-${p.city}-${p.zip}` : p.address;
               const dupe = await checkDuplicate(dupeAddr, p.city, p.zip, p.asking_price);
