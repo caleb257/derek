@@ -888,15 +888,7 @@ console.log(`🤙 Derek | ${process.env.IMAP_USER} | every ${POLL_MS/60000}min`)
 console.log(`Days Active col: ${colLetter(COL['Days Active'])} | Address col: ${colLetter(COL['Address'])} | Asking col: ${colLetter(COL['Asking Price'])}`);
 
 initSheet()
-  .then(() => {
-    // ONE-TIME: clear seen list so Derek rescans all emails from last 7 days
-    // Dupe detection on Active Deals prevents duplicate rows
-    console.log('🧹 Clearing seen list — will rescan all emails from last 7 days');
-    seen = new Set();
-    seenSheetReady = true;
-    seenDirty = true;
-    return Promise.resolve();
-  })
+  .then(() => loadSeenFromSheet())
   .then(() => loadKnownSenders())
   .then(() => backfillWholesalerDirectory())
   .then(() => { poll(); setInterval(poll, POLL_MS); })
