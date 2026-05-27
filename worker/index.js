@@ -77,6 +77,14 @@ async function loadSeenFromSheet() {
 async function flushSeen() {
   if (!seenSheetReady || !seenDirty) return;
   try {
+    // Only keep the last 2000 UIDs — prune oldest to keep set lean
+    // UIDs are IMAP sequential so highest = newest
+    const seenArr = [...seen].map(Number).sort((a,b) => a-b);
+    if (seenArr.length > 2000) {
+      const pruned = seenArr.slice(-2000); // keep newest 2000
+      seen = new Set(pruned.map(String));
+      console.log(`🧹 Pruned seen set to ${seen.size} UIDs`);
+    }
     const values = [['Email UID'], ...[...seen].map(uid => [uid])];
     await sc(() => getSheets().spreadsheets.values.clear({ spreadsheetId: SHEET_ID, range: 'Seen!A:A' }));
     await sc(() => getSheets().spreadsheets.values.update({
@@ -932,6 +940,60 @@ async function triggerUrbanUnderwrite(address, city, state, zip, uid) {
     }
   } catch (e) {
     console.log(`  ⚠️ Urban trigger failed: ${e.message}`);
+  }
+}
+
+// ── FORCE REPROCESS ──────────────────────────────────────────────────────────
+// Called on startup to clear any recent UIDs from seen that may have been
+// rejected but are actually valid deals worth re-extracting
+async function clearRecentFromSeen(daysBack = 3) {
+  try {
+    // Get recent UIDs from IMAP that are in seen, check if they're in Active Deals
+    // If NOT in Active Deals, remove from seen so they get reprocessed
+    const client = await connectImap();
+    const lock = await client.getMailboxLock('INBOX');
+    const since = new Date(Date.now() - daysBack * 24 * 60 * 60 * 1000);
+    const recentUIDs = [];
+    try {
+      for await (const msg of client.fetch({ since }, { envelope: true, uid: true })) {
+        recentUIDs.push(String(msg.uid));
+      }
+    } finally { lock.release(); }
+    await client.logout();
+
+    // Get addresses already in Active Deals sheet
+    const res = await sc(() => getSheets().spreadsheets.values.get({
+      spreadsheetId: SHEET_ID, range: 'Active Deals!E:E' // Address column
+    }));
+    const existingAddresses = new Set((res?.data?.values || []).slice(1).map(r => (r[0]||'').toLowerCase().trim()));
+
+    // Get seen sheet to check which UIDs correspond to which emails
+    const seenRes = await sc(() => getSheets().spreadsheets.values.get({
+      spreadsheetId: SHEET_ID, range: 'Seen!A:B' // UID, optional address
+    }));
+
+    // For recent UIDs in seen: remove them so Derek reprocesses
+    // This handles cases where extraction failed or Haiku wrongly rejected
+    let removed = 0;
+    for (const uid of recentUIDs) {
+      if (seen.has(uid)) {
+        // We don't know if it was a deal or not-a-deal rejection
+        // Safely: remove it and let Haiku/extraction decide again
+        // Dupes will be caught by checkDuplicate
+        seen.delete(uid);
+        removed++;
+      }
+    }
+
+    if (removed > 0) {
+      seenDirty = true;
+      await flushSeen();
+      console.log(`🔄 Cleared ${removed} recent UIDs from seen for reprocessing`);
+    } else {
+      console.log(`✅ No recent UIDs need reprocessing`);
+    }
+  } catch(e) {
+    console.log('clearRecentFromSeen error:', e.message);
   }
 }
 
