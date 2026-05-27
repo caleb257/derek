@@ -246,6 +246,7 @@ function normalizeAddr(addr, city, zip) {
 async function checkDuplicate(address, city, zip, newPrice) {
   if (!address) return { isDupe: false };
   const key = normalizeAddr(address, city, zip);
+  const isXXXX = /^x+$/i.test((address||'').trim()) || (address||'').trim() === 'XXXX';
   const addrIdx = COL['Address'], cityIdx = COL['City'];
   const zipIdx = COL['Zip'], priceIdx = COL['Asking Price'];
 
@@ -255,7 +256,30 @@ async function checkDuplicate(address, city, zip, newPrice) {
     })).catch(() => null);
     const rows = res?.data?.values || [];
     for (let i = 1; i < rows.length; i++) {
-      const existing = normalizeAddr(rows[i][addrIdx], rows[i][cityIdx], rows[i][zipIdx]);
+      const rowAddr = rows[i][addrIdx] || '';
+      const rowCity = rows[i][cityIdx] || '';
+      const rowZip = rows[i][zipIdx] || '';
+      const existing = normalizeAddr(rowAddr, rowCity, rowZip);
+
+      // For XXXX addresses: match on city + zip + price (same wholesaler, same area, same price = same deal)
+      if (isXXXX) {
+        const rowIsXXXX = /^x+$/i.test(rowAddr.trim()) || rowAddr.trim() === 'XXXX';
+        if (rowIsXXXX) {
+          const cityMatch = rowCity.toLowerCase().trim() === (city||'').toLowerCase().trim();
+          const zipMatch = rowZip.trim() === (zip||'').trim();
+          if (cityMatch && zipMatch) {
+            const oldPrice = safeNum(rows[i][priceIdx]);
+            const np = safeNum(newPrice);
+            if (np && oldPrice && Math.abs(np - oldPrice) > 1000) {
+              return { isDupe: true, isPriceChange: true, tab, oldPrice, newPrice: np };
+            }
+            return { isDupe: true, isPriceChange: false, tab };
+          }
+        }
+        continue; // XXXX vs real address = not a dupe
+      }
+
+      // Normal address matching
       if (!existing || existing !== key) continue;
       const oldPrice = safeNum(rows[i][priceIdx]);
       const np = safeNum(newPrice);
@@ -815,7 +839,70 @@ async function poll() {
         try {
           const msgData = await client.fetchOne(c.uid, { source: true }, { uid: true });
           const parsed = await simpleParser(msgData.source);
-          const rawBody = parsed.text || (parsed.html||'').replace(/<[^>]*>/g,' ').replace(/\s+/g,' ');
+          // Extract text body — also pull HTML text nodes for image-heavy emails
+          const htmlBody = parsed.html || '';
+          let rawBody = parsed.text || '';
+
+          // If text body is thin, extract text from HTML (alt text, link text, visible text nodes)
+          if (rawBody.trim().length < 200 && htmlBody) {
+            rawBody = htmlBody
+              .replace(/<style[^>]*>.*?<\/style>/gis, '')   // strip style blocks
+              .replace(/<script[^>]*>.*?<\/script>/gis, '')  // strip scripts
+              .replace(/<img[^>]+alt="([^"]+)"/gi, ' $1 ')   // extract alt text
+              .replace(/<a[^>]+href="([^"]+)"[^>]*>([^<]*)<\/a>/gi, ' $2 ($1) ') // link text + href
+              .replace(/<[^>]+>/g, ' ')                       // strip remaining tags
+              .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+              .replace(/\s+/g, ' ').trim();
+          }
+
+          // Extract image URLs from HTML for Vision processing
+          const imgUrls = [];
+          if (htmlBody) {
+            const imgMatches = [...htmlBody.matchAll(/<img[^>]+src="(https?:\/\/[^"]+)"/gi)];
+            imgUrls.push(...imgMatches.map(m => m[1]).slice(0, 3)); // max 3 images
+          }
+
+          // If body still thin AND we have images, use Vision to read them
+          const isBodyThin = rawBody.trim().length < 300;
+          if (isBodyThin && imgUrls.length > 0) {
+            console.log(`  🖼️ Thin body (${rawBody.trim().length} chars) + ${imgUrls.length} images — using Vision`);
+            try {
+              const visionContent = [];
+              for (const url of imgUrls) {
+                try {
+                  const imgRes = await fetch(url, {
+                    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Coralstone/1.0)' },
+                    timeout: 8000
+                  });
+                  if (!imgRes.ok) continue;
+                  const buf = await imgRes.buffer();
+                  const mime = imgRes.headers.get('content-type') || 'image/jpeg';
+                  // Only use if reasonable size (< 5MB)
+                  if (buf.length < 5 * 1024 * 1024) {
+                    visionContent.push({
+                      type: 'image',
+                      source: { type: 'base64', media_type: mime.split(';')[0], data: buf.toString('base64') }
+                    });
+                  }
+                } catch(imgErr) { console.log(`  Image fetch failed: ${imgErr.message}`); }
+              }
+              if (visionContent.length > 0) {
+                visionContent.push({
+                  type: 'text',
+                  text: `Email subject: ${c.subj}\nFrom: ${c.from}\nExtract ALL visible text from this real estate email image — addresses, prices, beds/baths, contact info, ARV, repairs, everything you can read.`
+                });
+                const visionRes = await anthropic.messages.create({
+                  model: 'claude-haiku-4-5-20251001', max_tokens: 2000,
+                  messages: [{ role: 'user', content: visionContent }]
+                });
+                const visionText = visionRes.content[0].text;
+                console.log(`  🖼️ Vision extracted ${visionText.length} chars`);
+                rawBody = visionText + '\n\n' + rawBody; // prepend vision text
+              }
+            } catch(visionErr) {
+              console.log(`  Vision error: ${visionErr.message}`);
+            }
+          }
 
           // Smart screening: known senders + strong keywords → skip Haiku entirely
           // Everyone else gets a fast Haiku YES/NO check (~$0.0001 each)
