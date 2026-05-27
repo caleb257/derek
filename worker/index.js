@@ -6,6 +6,8 @@ const { google } = require('googleapis');
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const SHEET_ID = process.env.GOOGLE_SHEET_ID;
+const URBAN_URL = process.env.URBAN_URL || 'https://urban-production-cffb.up.railway.app';
+const URBAN_TOKEN = process.env.URBAN_TOKEN || process.env.URBAN_PASSWORD || 'coralstone2025';
 
 process.on('uncaughtException', e => console.error('ERR:', e.message));
 process.on('unhandledRejection', e => console.error('REJ:', e?.message || e));
@@ -855,6 +857,11 @@ async function poll() {
                   propType, v(p.asking_price));
                 console.log(`  ✅ [${propType}] ${p.address}, ${p.city} | Ask:$${p.asking_price} ARV:$${p.arv}`);
                 written++;
+                // Auto-underwrite via Urban (non-blocking)
+                const dealUID = c.uid || `${p.address}-${new Date().toISOString().split('T')[0]}`;
+                triggerUrbanUnderwrite(
+                  v(p.address), v(p.city), v(p.state), v(p.zip), dealUID
+                ).catch(e => console.log(`  Urban trigger err: ${e.message}`));
               }
               await new Promise(r => setTimeout(r, 300));
             }
@@ -879,6 +886,51 @@ async function poll() {
     await flushSeen();
   } finally {
     if (client) { try { await client.logout(); } catch {} }
+  }
+}
+
+// ── TRIGGER URBAN AUTO-UNDERWRITE ────────────────────────────────────────────
+async function triggerUrbanUnderwrite(address, city, state, zip, uid) {
+  try {
+    console.log(`  🏙️ Triggering Urban auto-underwrite for ${address}...`);
+    // Hit Urban's underwrite endpoint — fire and forget (don't await full response)
+    // Urban uses SSE streaming so we just open the connection and let it run
+    const encUid = encodeURIComponent(uid);
+    const res = await fetch(`${URBAN_URL}/api/underwrite/${encUid}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-urban-token': URBAN_TOKEN
+      },
+      body: JSON.stringify({ forceRefresh: false, deep: false }),
+      signal: AbortSignal.timeout(180000) // 3 min timeout
+    });
+    if (!res.ok) {
+      console.log(`  ⚠️ Urban returned ${res.status}`);
+      return;
+    }
+    // Drain the SSE stream
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = dec.decode(value, { stream: true });
+      const lines = chunk.split('\n').filter(l => l.startsWith('data: '));
+      for (const line of lines) {
+        try {
+          const data = JSON.parse(line.slice(6));
+          if (data.status) console.log(`  🏙️ Urban: ${data.status}`);
+          if (data.done) {
+            const uw = data.underwrite;
+            console.log(`  ✅ Urban verdict: ${uw.verdict} (${uw.score}/10) — ${uw.verdictReason}`);
+          }
+          if (data.error) console.log(`  ❌ Urban error: ${data.error}`);
+        } catch {}
+      }
+    }
+  } catch (e) {
+    console.log(`  ⚠️ Urban trigger failed: ${e.message}`);
   }
 }
 
