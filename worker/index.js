@@ -446,10 +446,38 @@ Return ONLY valid JSON array. No markdown.` }]
   });
 
   try {
-    const text = res.content[0].text.trim().replace(/^```json\s*/,'').replace(/^```\s*/,'').replace(/\s*```$/,'').trim();
+    let text = res.content[0].text.trim().replace(/^```json\s*/,'').replace(/^```\s*/,'').replace(/\s*```$/,'').trim();
+    // Sometimes Haiku adds preamble — find the JSON array
+    const arrStart = text.indexOf('[');
+    const arrEnd = text.lastIndexOf(']');
+    if (arrStart > 0 && arrEnd > arrStart) text = text.slice(arrStart, arrEnd + 1);
     const parsed = JSON.parse(text);
     return Array.isArray(parsed) ? parsed : [parsed];
-  } catch (e) { console.error('Parse error:', e.message); return null; }
+  } catch (e) {
+    console.error('Parse error:', e.message, '— retrying with simplified prompt...');
+    // Retry once with a much simpler prompt focused on just key fields
+    try {
+      const retry = await getAnthropic().messages.create({
+        model: 'claude-haiku-4-5-20251001', max_tokens: 1000,
+        messages: [{
+          role: 'user',
+          content: `Extract the real estate deal from this email. Return ONLY a JSON array with one object per property.
+Required fields only: address, city, state, zip, beds, baths, sqft, asking_price, arv, contact_1_name, contact_1_email, contact_1_phone
+FROM: ${from}
+BODY: ${cleanBody.slice(0, 4000)}
+Return [] if no property found. Raw JSON array only.`
+        }]
+      });
+      const t2 = retry.content[0].text.trim().replace(/^```json\s*/,'').replace(/^```\s*/,'').replace(/\s*```$/,'').trim();
+      const s = t2.indexOf('['), e2 = t2.lastIndexOf(']');
+      const p2 = JSON.parse(s >= 0 ? t2.slice(s, e2+1) : t2);
+      console.log('Retry succeeded');
+      return Array.isArray(p2) ? p2 : [p2];
+    } catch(e2) {
+      console.error('Retry also failed:', e2.message);
+      return null;
+    }
+  }
 }
 
 // ── ROW BUILDER ───────────────────────────────────────────────────────────────
