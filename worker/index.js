@@ -336,8 +336,22 @@ async function getBrainContext(fromEmail) {
   const rows = res?.data?.values || [];
   for (let i = 1; i < rows.length; i++) {
     if (rows[i][0] === fromEmail) {
-      return { formatType: rows[i][4]||'', whatWorks: rows[i][6]||'',
-        watchOutFor: rows[i][7]||'', timesSent: safeInt(rows[i][3]) };
+      const qualityScore = parseInt(rows[i][7]) || null; // col H = quality score (0-10)
+      const hotDeals     = parseInt(rows[i][8]) || 0;   // col I = HOT/BUY count
+      const passDeals    = parseInt(rows[i][9]) || 0;   // col J = PASS/HARD NO count
+      return {
+        formatType:   rows[i][4] || '',
+        whatWorks:    rows[i][6] || '',
+        watchOutFor:  rows[i][7] || '',  // col H reused as watchOutFor in old schema
+        timesSent:    safeInt(rows[i][3]),
+        qualityScore, hotDeals, passDeals,
+        // Summary for hint injection
+        qualityNote: qualityScore !== null
+          ? (qualityScore >= 7 ? `HIGH QUALITY sender (${hotDeals} HOT deals) — prioritize`
+           : qualityScore <= 3 ? `LOW QUALITY sender (${passDeals} PASS/NO deals) — extract carefully, lower priority`
+           : `MID quality sender (${hotDeals} HOT, ${passDeals} PASS)`)
+          : null
+      };
     }
   }
   return null;
@@ -367,7 +381,8 @@ async function extractProperties(from, subject, body) {
   const brain = await getBrainContext(from);
   let hint = '';
   if (brain?.timesSent > 0) {
-    hint = `\n\nKNOWN SENDER (${brain.timesSent} prior emails): format=${brain.formatType}. ${brain.whatWorks}. Watch: ${brain.watchOutFor}.`;
+    hint = `\n\nKNOWN SENDER (${brain.timesSent} prior emails): format=${brain.formatType}. ${brain.whatWorks}.`;
+    if (brain.qualityNote) hint += `\nURBAN QUALITY RATING: ${brain.qualityNote}.`;
   }
   // Podio CRM hint — these emails have a specific field layout
   const isPodio = from.toLowerCase().includes('podio');
