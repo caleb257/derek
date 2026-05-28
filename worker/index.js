@@ -345,12 +345,12 @@ async function getBrainContext(fromEmail) {
         watchOutFor:  rows[i][7] || '',  // col H reused as watchOutFor in old schema
         timesSent:    safeInt(rows[i][3]),
         qualityScore, hotDeals, passDeals,
-        // Summary for hint injection
-        qualityNote: qualityScore !== null
-          ? (qualityScore >= 7 ? `HIGH QUALITY sender (${hotDeals} HOT deals) — prioritize`
-           : qualityScore <= 3 ? `LOW QUALITY sender (${passDeals} PASS/NO deals) — extract carefully, lower priority`
-           : `MID quality sender (${hotDeals} HOT, ${passDeals} PASS)`)
-          : null
+        // Summary for hint injection (PASS = neutral, only HARD NO counts negative)
+        qualityNote: qualityScore !== null && (hotDeals + passDeals) >= 2
+          ? (qualityScore >= 7 ? `HIGH QUALITY sender — ${hotDeals} of their deals scored HOT/BUY. Extract carefully and completely.`
+           : qualityScore <= 3 ? `LOW QUALITY sender — ${passDeals} HARD NO verdicts. Extract what you can but flag any red flags.`
+           : `MID quality sender — ${hotDeals} HOT/BUY, ${passDeals} HARD NO. Treat as normal.`)
+          : null  // not enough data yet to rate quality
       };
     }
   }
