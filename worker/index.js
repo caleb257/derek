@@ -392,11 +392,24 @@ async function extractProperties(from, subject, body) {
 
   const res = await anthropic.messages.create({
     model: 'claude-haiku-4-5-20251001', max_tokens: 4000,
-    messages: [{ role: 'user', content: `You are a real estate data extraction engine for Coralstone Capital Group.
+    messages: [{ role: 'user', content: `You are a real estate data extraction engine for Coralstone Capital Group (Tampa Bay FL fix-and-flip investors).
 Extract EVERY property from this wholesale deal email as a JSON array — one object per property.
-If this is a forwarded email (contains "Fwd:" or "---------- Forwarded message"), extract from the forwarded content.
-If no specific properties are mentioned but a URL or link is present, still extract whatever data is available.
-If there are no extractable properties at all, return an empty array [].${hint}
+If forwarded email (contains "Fwd:" or "---------- Forwarded message"), extract from the forwarded content.
+If no properties mentioned but URL/link present, extract what you can.
+If no extractable properties at all, return [].${hint}
+
+CORALSTONE BUYS: SFR, duplex, small multifamily in Pasco, Hillsborough, Polk, Pinellas, Hernando counties FL.
+Price range they buy: typically $80K-$500K asking. ARVs: $150K-$700K. Repairs: $15K-$150K.
+MAO formula: ARV × 70% - Repairs. Min profit target $40K.
+
+EXTRACTION RULES:
+- asking_price: the price the wholesaler wants. Look for: asking price, sales price, purchase price, our price, price
+- arv: after repair value. Look for: ARV, after repair, retail value, as-if value, comps support
+- repairs_estimate: Look for: repairs, rehab, renovation cost, estimated repairs
+- If a field says "call for address" or similar, set address to "XXXX"
+- Extract ALL phone numbers and emails you see — put best ones in contact_1, rest in all_phones/all_emails
+- extraction_confidence: your confidence 1-10 that you captured all key fields (10=every field clear, 1=barely any data)
+- extraction_notes: one sentence on what was hard to parse or what might be missing
 
 Fields per object (null if missing):
 address, city, state, zip, county, subdivision,
@@ -421,7 +434,8 @@ drive_link, zillow_link, google_maps_link, all_other_links,
 photos_included, photo_count, photo_links,
 comp_1, comp_2, comp_3,
 what_is_updated, what_needs_work, highlights, red_flags, additional_notes,
-wholesaler_company, list_name
+wholesaler_company, list_name,
+extraction_confidence(number 1-10), extraction_notes
 
 FROM: ${from}
 SUBJECT: ${subject}
