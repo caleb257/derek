@@ -1401,7 +1401,8 @@ async function poll() {
                 // Only trigger Urban for non-XXXX addresses (can't underwrite without address)
                 if (p.address && p.address !== 'XXXX') {
                   triggerUrbanUnderwrite(
-                    v(p.address), v(p.city), v(p.state), v(p.zip)
+                    v(p.address), v(p.city), v(p.state), v(p.zip),
+                    p.extraction_confidence ? parseInt(p.extraction_confidence) : null
                   ).catch(e => console.log(`  Urban trigger err: ${e.message}`));
                 }
               }
@@ -1443,18 +1444,24 @@ async function poll() {
 }
 
 // ── TRIGGER URBAN AUTO-UNDERWRITE ────────────────────────────────────────────
-async function triggerUrbanUnderwrite(address, city, state, zip) {
+async function triggerUrbanUnderwrite(address, city, state, zip, extractionConf = null) {
   try {
     console.log(`  🏙️ Triggering Urban auto-underwrite for ${address}...`);
     const encAddr = encodeURIComponent(address);
     const res = await fetch(`${URBAN_URL}/api/underwrite-by-address/${encAddr}`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-urban-token': URBAN_TOKEN
-      },
-      body: JSON.stringify({ forceRefresh: false, deep: false }),
-      signal: AbortSignal.timeout(180000) // 3 min timeout
+      headers: { 'Content-Type': 'application/json', 'x-urban-token': URBAN_TOKEN },
+      body: JSON.stringify({
+        forceRefresh: false, deep: false,
+        // Pass extraction quality so Urban knows how much to trust the raw data
+        extractionConfidence: extractionConf,
+        extractionNote: extractionConf !== null
+          ? (extractionConf >= 8 ? 'High confidence extraction — data reliable'
+           : extractionConf >= 5 ? 'Medium confidence — some fields estimated by Haiku'
+           : 'Low confidence — treat data with extra skepticism, verify key fields')
+          : null
+      }),
+      signal: AbortSignal.timeout(180000)
     });
     if (!res.ok) {
       console.log(`  ⚠️ Urban returned ${res.status}`);
@@ -1529,9 +1536,12 @@ initSheet()
     return loadKnownSenders();
   })
   .then(() => backfillWholesalerDirectory())
+  .then(() => loadUrbanIntel()) // pull Urban's market/wholesaler intelligence
   .then(() => clearStuckUIDs())
   .then(() => {
     poll();
     setInterval(poll, POLL_MS);
+    // Refresh Urban intel every 6 hours
+    setInterval(loadUrbanIntel, 6 * 60 * 60 * 1000);
   })
   .catch(e => { console.error('Init error:', e.message); poll(); setInterval(poll, POLL_MS); });
