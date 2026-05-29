@@ -1337,11 +1337,37 @@ async function poll() {
                 }));
                 const colAVals = colARes?.data?.values || [];
                 const nextRow = colAVals.length + 1; // 1-indexed, after last filled A cell
-                await sc(() => getSheets().spreadsheets.values.update({
-                  spreadsheetId: SHEET_ID, range: `Active Deals!A${nextRow}`,
-                  valueInputOption: 'RAW',
-                  requestBody: { values: [buildRow(p, c.subj, c.uid, propType)] }
-                }));
+                // Expand sheet if needed before writing
+                try {
+                  await sc(() => getSheets().spreadsheets.values.update({
+                    spreadsheetId: SHEET_ID, range: `Active Deals!A${nextRow}`,
+                    valueInputOption: 'RAW',
+                    requestBody: { values: [buildRow(p, c.subj, c.uid, propType)] }
+                  }));
+                } catch(sheetErr) {
+                  if (sheetErr.message && sheetErr.message.includes('exceeds grid limits')) {
+                    // Sheet is full — add 500 more rows then retry
+                    console.log('📋 Sheet full — expanding by 500 rows...');
+                    const meta = await sc(() => getSheets().spreadsheets.get({ spreadsheetId: SHEET_ID }));
+                    const sh = meta.data.sheets.find(s => s.properties.title === 'Active Deals');
+                    if (sh) {
+                      await sc(() => getSheets().spreadsheets.batchUpdate({
+                        spreadsheetId: SHEET_ID,
+                        requestBody: { requests: [{ appendDimension: {
+                          sheetId: sh.properties.sheetId,
+                          dimension: 'ROWS', length: 500
+                        }}]}
+                      }));
+                      // Retry the write
+                      await sc(() => getSheets().spreadsheets.values.update({
+                        spreadsheetId: SHEET_ID, range: `Active Deals!A${nextRow}`,
+                        valueInputOption: 'RAW',
+                        requestBody: { values: [buildRow(p, c.subj, c.uid, propType)] }
+                      }));
+                      console.log('📋 Sheet expanded and deal written');
+                    }
+                  } else { throw sheetErr; }
+                }
                 await updateWholesalerDirectory(c.from, v(p.wholesaler_company),
                   v(p.contact_1_name), v(p.contact_1_phone), v(p.contact_1_website),
                   propType, v(p.asking_price));
@@ -1397,7 +1423,8 @@ async function poll() {
             console.log(`  ↩️ Connection error — will retry UID ${c.uid} next poll`);
           } else {
             await logError(c.from, c.subj, c.uid, e.message);
-            seen.add(c.uid); seenDirty = true;
+            // NOTE: Do NOT add to seen on error — let Derek retry next poll
+            // seen.add(c.uid); <-- intentionally removed so crashed deals get retried
           }
           errors++;
         }
@@ -1502,6 +1529,7 @@ initSheet()
     return loadKnownSenders();
   })
   .then(() => backfillWholesalerDirectory())
+  .then(() => clearStuckUIDs())
   .then(() => {
     poll();
     setInterval(poll, POLL_MS);
