@@ -146,10 +146,21 @@ const safeInt = x => { const n = parseInt(String(x||'')); return isNaN(n) ? 0 : 
 
 // ── KEYWORDS ──────────────────────────────────────────────────────────────────
 const DEAL_WORDS = [
+  // Core wholesale language
   'off market','off-market','wholesale','flip','rehab','fixer','as-is','as is',
   'investment property','investment opportunity','bungalow','sfr',
   'arv','asking price','asking:','sales price','assignment fee',
-  'equity','cash buyer','cash only','price reduction','price drop','reduced',
+  'equity','cash buyer','cash only','price reduction','price drop','reduc',
+  // Tampa/FL-specific wholesaler language (free fast-passes, no Haiku needed)
+  'podio','assignment of contract','assignable','jv deal','jv opportunity',
+  'equitable interest','joint venture','emd','earnest money deposit',
+  'motivated seller','motivated vendor','must sell','estate sale','probate',
+  'pre-foreclosure','pre foreclosure','reo','bank owned','distressed',
+  'cash flow','rental income','turnkey','subject to','sub-to','novation',
+  'double close','wholesaler','investor special','handyman special',
+  'tlc','needs tlc','needs work','fixer upper','fix and flip',
+  'after repair value','repair value','all cash','no agents',
+  'closing costs paid','seller carry','seller finance',
   'motivated','must sell','below market','deal alert',
   '3/2','4/2','4/3','2/2','2/1','3/1','5/3','5/4','4/4','3/3',
   'distressed','foreclosure','pre-foreclosure','probate','divorce',
@@ -248,6 +259,32 @@ function detectPropertyType(p) {
 }
 
 // ── ADDRESS NORMALIZATION ─────────────────────────────────────────────────────
+function addrWordSet(addr) {
+  // Extract meaningful words from address for fuzzy matching
+  // Strips numbers that aren't street numbers, normalizes words
+  return new Set(
+    (addr||'').toLowerCase()
+      .replace(/[.,#]/g,'')
+      .replace(/\bstreet\b/g,'st').replace(/\bavenue\b/g,'ave')
+      .replace(/\bdrive\b/g,'dr').replace(/\bboulevard\b/g,'blvd')
+      .replace(/\broad\b/g,'rd').replace(/\bcourt\b/g,'ct')
+      .replace(/\blane\b/g,'ln').replace(/\bplace\b/g,'pl')
+      .replace(/\bcircle\b/g,'cir').replace(/\bterrace\b/g,'ter')
+      .replace(/\bnorth\b/g,'n').replace(/\bsouth\b/g,'s')
+      .replace(/\beast\b/g,'e').replace(/\bwest\b/g,'w')
+      .split(/\s+/).filter(w => w.length > 1)
+  );
+}
+function fuzzyAddrMatch(a1, a2) {
+  if (!a1 || !a2) return false;
+  const s1 = addrWordSet(a1), s2 = addrWordSet(a2);
+  if (!s1.size || !s2.size) return false;
+  // All meaningful words from the shorter address must appear in the longer
+  const [smaller, larger] = s1.size <= s2.size ? [s1, s2] : [s2, s1];
+  const overlap = [...smaller].filter(w => larger.has(w)).length;
+  return overlap >= smaller.size * 0.8; // 80% word overlap = match
+}
+
 function normalizeAddr(addr, city, zip) {
   return `${addr||''} ${city||''} ${zip||''}`.toLowerCase()
     .replace(/[.,#]/g,'')
@@ -304,7 +341,7 @@ async function checkDuplicate(address, city, zip, newPrice) {
       if (!existing || existing !== key) continue;
       const oldPrice = safeNum(rows[i][priceIdx]);
       const np = safeNum(newPrice);
-      if (np && oldPrice && Math.abs(np - oldPrice) > 100) {
+      if (np && oldPrice && Math.abs(np - oldPrice) > 2000) {
         return { isDupe: true, isPriceChange: true, tab, oldPrice, newPrice: np };
       }
       return { isDupe: true, isPriceChange: false, tab };
@@ -314,13 +351,45 @@ async function checkDuplicate(address, city, zip, newPrice) {
 }
 
 // ── FOOTER STRIP ──────────────────────────────────────────────────────────────
+function unwrapForwards(text) {
+  if (!text) return text;
+  // Find the innermost forwarded message — that's where the actual deal is
+  const fwdMarkers = [
+    /^-{5,}\s*Forwarded message\s*-{5,}/im,
+    /^-{5,}\s*Original Message\s*-{5,}/im,
+    /^_{5,}/m,
+    /^From:.*Sent:.*To:/ims,
+  ];
+  let result = text;
+  let found = true;
+  let iterations = 0;
+  while (found && iterations < 5) {
+    found = false;
+    for (const marker of fwdMarkers) {
+      const match = marker.exec(result);
+      if (match) {
+        // Take content AFTER the forward marker
+        const inner = result.slice(match.index + match[0].length).trim();
+        if (inner.length > 100) { result = inner; found = true; break; }
+      }
+    }
+    iterations++;
+  }
+  // Strip quoted reply lines ("> some text")
+  result = result.split('\n').filter(l => !l.trim().startsWith('>')).join('\n');
+  return result.trim();
+}
+
 function stripFooters(text) {
   if (!text) return '';
+  // Unwrap forward chains first — get to the actual deal
+  text = unwrapForwards(text);
   const cuts = [/^unsubscribe/im,/^to unsubscribe/im,/^you (are|were) receiving/im,
     /^this email was sent/im,/^you received this/im,/^if you no longer/im,
     /^confidentiality notice/im,/^disclaimer:/im,/^this message (is|was) sent/im,
     /^remove me/im,/^manage (your )?preferences/im,/^privacy policy/im,
-    /^view in browser/im,/^having trouble viewing/im,/^©\s*20/im,/^sent from my/im];
+    /^view in browser/im,/^having trouble viewing/im,/^©\s*20/im,/^sent from my/im,
+    /^this e-?mail/im,/^legal notice/im,/^privileged/im,/^intended recipient/im];
   const lines = text.split('\n');
   for (let i = 0; i < lines.length; i++) {
     if (cuts.some(rx => rx.test(lines[i].trim()))) return lines.slice(0, i).join('\n').trim();
@@ -375,14 +444,167 @@ Body preview: ${preview}` }]
   return answer.startsWith('Y');
 }
 
+// ── FL ZIP-TO-COUNTY LOOKUP (free, no API) ────────────────────────────────────
+const FL_ZIP_COUNTY = {
+  // Hillsborough
+  33511:['Brandon','Hillsborough'],33527:['Dover','Hillsborough'],33534:['Gibsonton','Hillsborough'],
+  33547:['Lithia','Hillsborough'],33548:['Lutz','Hillsborough'],33549:['Lutz','Hillsborough'],
+  33556:['Odessa','Hillsborough'],33558:['Lutz','Hillsborough'],33559:['Lutz','Hillsborough'],
+  33563:['Plant City','Hillsborough'],33565:['Plant City','Hillsborough'],33566:['Plant City','Hillsborough'],
+  33567:['Plant City','Hillsborough'],33569:['Riverview','Hillsborough'],33570:['Ruskin','Hillsborough'],
+  33572:['Apollo Beach','Hillsborough'],33573:['Sun City Center','Hillsborough'],
+  33578:['Riverview','Hillsborough'],33579:['Riverview','Hillsborough'],
+  33584:['Seffner','Hillsborough'],33586:['Sun City Center','Hillsborough'],
+  33592:['Thonotosassa','Hillsborough'],33594:['Valrico','Hillsborough'],33596:['Valrico','Hillsborough'],
+  33602:['Tampa','Hillsborough'],33603:['Tampa','Hillsborough'],33604:['Tampa','Hillsborough'],
+  33605:['Tampa','Hillsborough'],33606:['Tampa','Hillsborough'],33607:['Tampa','Hillsborough'],
+  33608:['Tampa','Hillsborough'],33609:['Tampa','Hillsborough'],33610:['Tampa','Hillsborough'],
+  33611:['Tampa','Hillsborough'],33612:['Tampa','Hillsborough'],33613:['Tampa','Hillsborough'],
+  33614:['Tampa','Hillsborough'],33615:['Tampa','Hillsborough'],33616:['Tampa','Hillsborough'],
+  33617:['Tampa','Hillsborough'],33618:['Tampa','Hillsborough'],33619:['Tampa','Hillsborough'],
+  33620:['Tampa','Hillsborough'],33621:['Tampa','Hillsborough'],33624:['Tampa','Hillsborough'],
+  33625:['Tampa','Hillsborough'],33626:['Tampa','Hillsborough'],33629:['Tampa','Hillsborough'],
+  33634:['Tampa','Hillsborough'],33635:['Tampa','Hillsborough'],33637:['Tampa','Hillsborough'],
+  33647:['Tampa','Hillsborough'],33697:['Tampa','Hillsborough'],
+  // Pasco
+  33523:['Dade City','Pasco'],33524:['Dade City','Pasco'],33525:['Dade City','Pasco'],
+  33526:['Dade City','Pasco'],33540:['Zephyrhills','Pasco'],33541:['Zephyrhills','Pasco'],
+  33542:['Zephyrhills','Pasco'],33543:['Wesley Chapel','Pasco'],33544:['Wesley Chapel','Pasco'],
+  33545:['Wesley Chapel','Pasco'],33553:['San Antonio','Pasco'],33576:['San Antonio','Pasco'],
+  33597:['San Antonio','Pasco'],34610:['Spring Hill','Pasco'],34637:['Land O Lakes','Pasco'],
+  34638:['Land O Lakes','Pasco'],34639:['Land O Lakes','Pasco'],34652:['New Port Richey','Pasco'],
+  34653:['New Port Richey','Pasco'],34654:['New Port Richey','Pasco'],34655:['New Port Richey','Pasco'],
+  34667:['Hudson','Pasco'],34668:['Port Richey','Pasco'],34669:['Hudson','Pasco'],
+  34673:['Port Richey','Pasco'],34674:['Hudson','Pasco'],
+  // Pinellas
+  33701:['St. Petersburg','Pinellas'],33702:['St. Petersburg','Pinellas'],
+  33703:['St. Petersburg','Pinellas'],33704:['St. Petersburg','Pinellas'],
+  33705:['St. Petersburg','Pinellas'],33706:['St. Petersburg','Pinellas'],
+  33707:['St. Petersburg','Pinellas'],33708:['St. Petersburg','Pinellas'],
+  33709:['St. Petersburg','Pinellas'],33710:['St. Petersburg','Pinellas'],
+  33711:['St. Petersburg','Pinellas'],33712:['St. Petersburg','Pinellas'],
+  33713:['St. Petersburg','Pinellas'],33714:['St. Petersburg','Pinellas'],
+  33715:['St. Petersburg','Pinellas'],33716:['St. Petersburg','Pinellas'],
+  33755:['Clearwater','Pinellas'],33756:['Clearwater','Pinellas'],33759:['Clearwater','Pinellas'],
+  33760:['Clearwater','Pinellas'],33761:['Clearwater','Pinellas'],33762:['Clearwater','Pinellas'],
+  33763:['Clearwater','Pinellas'],33764:['Clearwater','Pinellas'],33765:['Clearwater','Pinellas'],
+  33767:['Clearwater','Pinellas'],33770:['Largo','Pinellas'],33771:['Largo','Pinellas'],
+  33772:['Seminole','Pinellas'],33773:['Largo','Pinellas'],33774:['Largo','Pinellas'],
+  33776:['Seminole','Pinellas'],33777:['Seminole','Pinellas'],33778:['Largo','Pinellas'],
+  33781:['Pinellas Park','Pinellas'],33782:['Pinellas Park','Pinellas'],
+  33785:['Indian Rocks Beach','Pinellas'],33786:['Belleair Beach','Pinellas'],
+  34677:['Oldsmar','Pinellas'],34683:['Palm Harbor','Pinellas'],34684:['Palm Harbor','Pinellas'],
+  34685:['Palm Harbor','Pinellas'],34688:['Tarpon Springs','Pinellas'],34689:['Tarpon Springs','Pinellas'],
+  34695:['Safety Harbor','Pinellas'],34698:['Dunedin','Pinellas'],
+  // Hernando
+  34601:['Brooksville','Hernando'],34602:['Brooksville','Hernando'],34604:['Brooksville','Hernando'],
+  34606:['Spring Hill','Hernando'],34607:['Spring Hill','Hernando'],34608:['Spring Hill','Hernando'],
+  34609:['Spring Hill','Hernando'],34613:['Brooksville','Hernando'],34614:['Brooksville','Hernando'],
+  34614:['Brooksville','Hernando'],34636:['Brooksville','Hernando'],
+  // Polk
+  33801:['Lakeland','Polk'],33803:['Lakeland','Polk'],33805:['Lakeland','Polk'],
+  33809:['Lakeland','Polk'],33810:['Lakeland','Polk'],33811:['Lakeland','Polk'],
+  33812:['Lakeland','Polk'],33813:['Lakeland','Polk'],33815:['Lakeland','Polk'],
+  33823:['Auburndale','Polk'],33825:['Avon Park','Polk'],33826:['Avon Park','Polk'],
+  33827:['Babson Park','Polk'],33830:['Bartow','Polk'],33837:['Davenport','Polk'],
+  33838:['Dundee','Polk'],33839:['Eagle Lake','Polk'],33840:['Haines City','Polk'],
+  33843:['Frostproof','Polk'],33844:['Haines City','Polk'],33849:['Kathleen','Polk'],
+  33850:['Lake Alfred','Polk'],33851:['Lake Hamilton','Polk'],33853:['Lake Wales','Polk'],
+  33859:['Lake Wales','Polk'],33860:['Mulberry','Polk'],33868:['Polk City','Polk'],
+  33880:['Winter Haven','Polk'],33881:['Winter Haven','Polk'],33884:['Winter Haven','Polk'],
+  33898:['Lake Wales','Polk'],33901:['Fort Meade','Polk'],33905:['Plant City','Hillsborough'],
+};
+function zipToCountyCity(zip) {
+  if (!zip) return null;
+  const z = parseInt(String(zip).replace(/\D/g,''));
+  return FL_ZIP_COUNTY[z] || null; // returns [city, county] or null
+}
+
 // ── EXTRACTION ────────────────────────────────────────────────────────────────
+// Extract deal data from subject line with regex — free, instant, no AI
+function extractFromSubject(subject) {
+  if (!subject) return {};
+  const s = subject;
+  const hints = {};
+
+  // Price: $185K, $185,000, $185k, 185K
+  const priceMatch = s.match(/\$?([\d,]+\.?\d*)\s*([KkMm]?)\s*(?:asking|ask|price|arv)?/i);
+  if (priceMatch) {
+    let val = parseFloat(priceMatch[1].replace(/,/g,''));
+    const mult = priceMatch[2].toLowerCase();
+    if (mult === 'k') val *= 1000;
+    if (mult === 'm') val *= 1000000;
+    if (val > 20000 && val < 5000000) {
+      // If "ARV" appears before the number, it's ARV; otherwise it's asking
+      const beforeNum = s.slice(0, priceMatch.index).toLowerCase();
+      if (beforeNum.includes('arv')) hints.arv = val;
+      else hints.asking_price = val;
+    }
+  }
+
+  // Second price for ARV (look for ARV $X pattern specifically)
+  const arvMatch = s.match(/ARV[:\s]+\$?([\d,]+\.?\d*)\s*([KkMm]?)/i);
+  if (arvMatch) {
+    let val = parseFloat(arvMatch[1].replace(/,/g,''));
+    const mult = arvMatch[2].toLowerCase();
+    if (mult === 'k') val *= 1000;
+    if (mult === 'm') val *= 1000000;
+    if (val > 20000 && val < 5000000) hints.arv = val;
+  }
+
+  // Asking from "Asking $X" or "Ask: $X"
+  const askMatch = s.match(/(?:asking|ask)[:\s]+\$?([\d,]+\.?\d*)\s*([KkMm]?)/i);
+  if (askMatch) {
+    let val = parseFloat(askMatch[1].replace(/,/g,''));
+    const mult = askMatch[2].toLowerCase();
+    if (mult === 'k') val *= 1000;
+    if (mult === 'm') val *= 1000000;
+    if (val > 20000 && val < 5000000) hints.asking_price = val;
+  }
+
+  // Beds/baths: "3/2", "3bd/2ba", "4 bed 2 bath"
+  const bdMatch = s.match(/(\d)\s*(?:\/|bed|bd)\s*(\d)\s*(?:ba|bath)?/i);
+  if (bdMatch) { hints.beds = parseInt(bdMatch[1]); hints.baths = parseInt(bdMatch[2]); }
+
+  // City from common Tampa Bay cities in subject
+  const cities = ['Land O Lakes','Wesley Chapel','New Port Richey','Port Richey',
+    'Spring Hill','Brooksville','Zephyrhills','Dade City','Lutz','Odessa','Trinity','Brandon',
+    'Riverview','Valrico','Seffner','Plant City','Temple Terrace','Tampa','St Pete',
+    'St. Petersburg','Clearwater','Largo','Pinellas Park','Dunedin','Tarpon Springs',
+    'Safety Harbor','Seminole','Palm Harbor','Lakeland','Winter Haven','Auburndale'];
+  for (const city of cities) {
+    if (s.toLowerCase().includes(city.toLowerCase())) {
+      hints.city = city; hints.state = 'FL'; break;
+    }
+  }
+
+  // Zip code: 5-digit starting with 33 or 34
+  const zipMatch = s.match(/(3[34]\d{3})/);
+  if (zipMatch) hints.zip = zipMatch[1];
+
+  return hints;
+}
+
 async function extractProperties(from, subject, body) {
   const cleanBody = stripFooters(body);
   const brain = await getBrainContext(from);
+  
+  // Pre-extract from subject line — free hints for Haiku
+  const subjHints = extractFromSubject(subject);
   let hint = '';
   if (brain?.timesSent > 0) {
     hint = `\n\nKNOWN SENDER (${brain.timesSent} prior emails): format=${brain.formatType}. ${brain.whatWorks}.`;
     if (brain.qualityNote) hint += `\nURBAN QUALITY RATING: ${brain.qualityNote}.`;
+  }
+
+  // Inject subject line pre-extracts as hints to Haiku (free, improves accuracy)
+  if (Object.keys(subjHints).length > 0) {
+    hint += '\n\nSUBJECT LINE HINTS (already extracted — use these if body is ambiguous):';
+    if (subjHints.asking_price) hint += `\n- Asking price from subject: $${subjHints.asking_price.toLocaleString()}`;
+    if (subjHints.arv)          hint += `\n- ARV from subject: $${subjHints.arv.toLocaleString()}`;
+    if (subjHints.beds)         hint += `\n- Beds/baths from subject: ${subjHints.beds}bd/${subjHints.baths}ba`;
+    if (subjHints.city)         hint += `\n- City from subject: ${subjHints.city}, ${subjHints.state}`;
+    if (subjHints.zip)          hint += `\n- Zip from subject: ${subjHints.zip}`;
   }
   // Podio CRM hint — these emails have a specific field layout
   const isPodio = from.toLowerCase().includes('podio');
@@ -481,7 +703,22 @@ Return [] if no property found. Raw JSON array only.`
 }
 
 // ── ROW BUILDER ───────────────────────────────────────────────────────────────
+function normalizePhone(raw) {
+  if (!raw) return raw;
+  const digits = String(raw).replace(/\D/g, '');
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits[0] === '1') return `+${digits}`;
+  return raw; // return as-is if can't normalize
+}
+
 function buildRow(p, subject, uid, propType) {
+  // Normalize all phone numbers to E.164 format for clean deduplication
+  ['contact_1_phone','contact_1_phone_2','contact_2_phone','contact_3_phone','seller_phone'].forEach(f => {
+    if (p[f]) p[f] = normalizePhone(p[f]);
+  });
+  if (p.all_phones) {
+    p.all_phones = p.all_phones.split(/[,;|]/).map(ph => normalizePhone(ph.trim())).join(', ');
+  }
   const now = new Date();
   const expires = new Date(now.getTime() + 7*24*60*60*1000);
   return [
@@ -1226,9 +1463,10 @@ async function triggerUrbanUnderwrite(address, city, state, zip) {
 function clearRecentFromSeen(count = 50) {
   try {
     if (seen.size === 0) return;
-    // Sort all seen UIDs numerically, take the top `count`
-    const sorted = [...seen].map(Number).filter(n => !isNaN(n)).sort((a, b) => b - a);
-    const toRemove = sorted.slice(0, count);
+    // Remove OLDEST UIDs, not newest — we want to keep recent ones we already processed
+    // UIDs are IMAP message numbers — higher = newer. Remove lowest (oldest) ones.
+    const sorted = [...seen].map(Number).filter(n => !isNaN(n)).sort((a, b) => a - b); // ascending = oldest first
+    const toRemove = sorted.slice(0, count); // remove oldest 50
     let removed = 0;
     for (const uid of toRemove) {
       seen.delete(String(uid));
