@@ -716,8 +716,10 @@ function buildRow(p, subject, uid, propType) {
   ['contact_1_phone','contact_1_phone_2','contact_2_phone','contact_3_phone','seller_phone'].forEach(f => {
     if (p[f]) p[f] = normalizePhone(p[f]);
   });
-  if (p.all_phones) {
+  if (p.all_phones && typeof p.all_phones === 'string') {
     p.all_phones = p.all_phones.split(/[,;|]/).map(ph => normalizePhone(ph.trim())).join(', ');
+  } else if (Array.isArray(p.all_phones)) {
+    p.all_phones = p.all_phones.map(ph => normalizePhone(String(ph).trim())).join(', ');
   }
   const now = new Date();
   const expires = new Date(now.getTime() + 7*24*60*60*1000);
